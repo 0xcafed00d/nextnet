@@ -43,6 +43,7 @@ type Emulator struct {
 	echo            bool
 	mux             bool
 	payloadExpected int
+	payloadSocketID int
 	payload         []byte
 	outputMu        sync.Mutex
 	socketManager   *sockets.Manager
@@ -87,11 +88,11 @@ func (e *Emulator) Serve(ctx context.Context, transport Transport) error {
 
 	output := make(chan []byte, outputFrames)
 	e.socketManager = sockets.New(e.config.Dialer, sockets.Events{
-		Data: func(payload []byte) {
-			e.emitIPD(serveCtx, output, payload)
+		Data: func(link sockets.Link, payload []byte) {
+			e.emitIPD(serveCtx, output, link, payload)
 		},
-		Closed: func() {
-			e.emitClosed(serveCtx, output)
+		Closed: func(link sockets.Link) {
+			e.emitClosed(serveCtx, output, link)
 		},
 	}, e.config.WriteTimeout)
 
@@ -109,7 +110,7 @@ func (e *Emulator) Serve(ctx context.Context, transport Transport) error {
 	go func() {
 		select {
 		case <-serveCtx.Done():
-			e.socketManager.Close()
+			e.socketManager.CloseAll()
 			_ = transport.Close()
 		case <-closeOnCancelDone:
 		}
@@ -149,7 +150,7 @@ readLoop:
 	}
 
 	cancel()
-	e.socketManager.Close()
+	e.socketManager.CloseAll()
 	_ = transport.Close()
 	e.socketManager.Wait()
 	close(output)
@@ -222,6 +223,7 @@ func (e *Emulator) processEvent(ctx context.Context, output chan<- []byte, event
 	}
 	if result.payloadLength > 0 {
 		e.payloadExpected = result.payloadLength
+		e.payloadSocketID = result.payloadConnectionID
 		e.payload = make([]byte, 0, result.payloadLength)
 	}
 	return nil
@@ -234,14 +236,16 @@ func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- []byte,
 	}
 
 	payload := e.payload
+	socketID := e.payloadSocketID
 	e.payload = nil
 	e.payloadExpected = 0
-	e.logger.Info("CIPSEND payload received", "bytes", len(payload))
+	e.payloadSocketID = 0
+	e.logger.Info("CIPSEND payload received", "id", socketID, "bytes", len(payload))
 
 	e.outputMu.Lock()
 	defer e.outputMu.Unlock()
-	if err := e.socketManager.Send(payload); err != nil {
-		e.logger.Warn("socket send failed", "bytes", len(payload), "error", err)
+	if err := e.socketManager.Send(socketID, payload); err != nil {
+		e.logger.Warn("socket send failed", "id", socketID, "bytes", len(payload), "error", err)
 		if enqueueErr := enqueue(ctx, output, responseSendFail); enqueueErr != nil {
 			return enqueueErr
 		}
@@ -251,32 +255,40 @@ func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- []byte,
 	if err := enqueue(ctx, output, responseSendOK); err != nil {
 		return err
 	}
-	e.logger.Info("socket sent", "id", 0, "bytes", len(payload))
+	e.logger.Info("socket sent", "id", socketID, "bytes", len(payload))
 	e.logger.Info("AT -> SEND OK")
 	return nil
 }
 
-func (e *Emulator) emitIPD(ctx context.Context, output chan<- []byte, payload []byte) {
+func (e *Emulator) emitIPD(ctx context.Context, output chan<- []byte, link sockets.Link, payload []byte) {
+	e.outputMu.Lock()
 	frame := make([]byte, 0, len(payload)+32)
 	frame = append(frame, "+IPD,"...)
+	if link.Multiplexed {
+		frame = strconv.AppendInt(frame, int64(link.ID), 10)
+		frame = append(frame, ',')
+	}
 	frame = strconv.AppendInt(frame, int64(len(payload)), 10)
 	frame = append(frame, ':')
 	frame = append(frame, payload...)
 
-	e.outputMu.Lock()
 	err := enqueue(ctx, output, frame)
 	e.outputMu.Unlock()
 	if err == nil {
-		e.logger.Info("socket received", "id", 0, "bytes", len(payload))
+		e.logger.Info("socket received", "id", link.ID, "bytes", len(payload))
 	}
 }
 
-func (e *Emulator) emitClosed(ctx context.Context, output chan<- []byte) {
+func (e *Emulator) emitClosed(ctx context.Context, output chan<- []byte, link sockets.Link) {
 	e.outputMu.Lock()
-	err := enqueue(ctx, output, []byte("\r\nCLOSED\r\n"))
+	frame := []byte("\r\nCLOSED\r\n")
+	if link.Multiplexed {
+		frame = []byte(fmt.Sprintf("\r\n%d,CLOSED\r\n", link.ID))
+	}
+	err := enqueue(ctx, output, frame)
 	e.outputMu.Unlock()
 	if err == nil {
-		e.logger.Info("socket closed", "id", 0, "cause", "remote")
+		e.logger.Info("socket closed", "id", link.ID, "cause", "remote")
 	}
 }
 
@@ -284,6 +296,7 @@ func (e *Emulator) resetState() {
 	e.echo = true
 	e.mux = false
 	e.payloadExpected = 0
+	e.payloadSocketID = 0
 	e.payload = nil
 }
 

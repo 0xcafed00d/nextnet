@@ -6,31 +6,51 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+const (
+	MinConnectionID = 0
+	MaxConnectionID = 4
+)
+
 var (
-	ErrAlreadyConnected = errors.New("a socket is already connected")
-	ErrNoConnection     = errors.New("no socket is connected")
+	ErrAlreadyConnected = errors.New("socket ID is already connected")
+	ErrNoConnection     = errors.New("socket ID is not connected")
+	ErrInvalidID        = errors.New("socket ID is out of range")
 )
 
 type Dialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
+type Link struct {
+	ID          int
+	Multiplexed bool
+}
+
 type Events struct {
-	Data   func([]byte)
-	Closed func()
+	Data   func(Link, []byte)
+	Closed func(Link)
+}
+
+type Status struct {
+	ID         int
+	Network    string
+	RemoteHost string
+	RemotePort int
+	LocalPort  int
 }
 
 type Manager struct {
 	mu           sync.Mutex
 	readers      sync.WaitGroup
-	connection   *connection
-	dialing      bool
+	connections  map[int]*connection
+	dialing      map[int]struct{}
 	dialer       Dialer
 	events       Events
 	writeTimeout time.Duration
@@ -39,18 +59,25 @@ type Manager struct {
 
 type connection struct {
 	net.Conn
+	link       Link
+	network    string
+	remoteHost string
+	remotePort int
+	localPort  int
 	localClose atomic.Bool
 	writeMu    sync.Mutex
 }
 
 func New(dialer Dialer, events Events, writeTimeout time.Duration) *Manager {
 	if events.Data == nil {
-		events.Data = func([]byte) {}
+		events.Data = func(Link, []byte) {}
 	}
 	if events.Closed == nil {
-		events.Closed = func() {}
+		events.Closed = func(Link) {}
 	}
 	return &Manager{
+		connections:  make(map[int]*connection),
+		dialing:      make(map[int]struct{}),
 		dialer:       dialer,
 		events:       events,
 		writeTimeout: writeTimeout,
@@ -58,7 +85,10 @@ func New(dialer Dialer, events Events, writeTimeout time.Duration) *Manager {
 	}
 }
 
-func (m *Manager) StartTCP(ctx context.Context, host string, port int) error {
+func (m *Manager) StartTCP(ctx context.Context, link Link, host string, port int) error {
+	if err := validateID(link.ID); err != nil {
+		return err
+	}
 	if host == "" {
 		return fmt.Errorf("host must not be empty")
 	}
@@ -67,18 +97,22 @@ func (m *Manager) StartTCP(ctx context.Context, host string, port int) error {
 	}
 
 	m.mu.Lock()
-	if m.connection != nil || m.dialing {
+	if _, connected := m.connections[link.ID]; connected {
 		m.mu.Unlock()
-		return ErrAlreadyConnected
+		return fmt.Errorf("%w: %d", ErrAlreadyConnected, link.ID)
 	}
-	m.dialing = true
+	if _, dialing := m.dialing[link.ID]; dialing {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %d", ErrAlreadyConnected, link.ID)
+	}
+	m.dialing[link.ID] = struct{}{}
 	m.mu.Unlock()
 
 	address := net.JoinHostPort(host, strconv.Itoa(port))
 	networkConnection, err := m.dialer.DialContext(ctx, "tcp", address)
 
 	m.mu.Lock()
-	m.dialing = false
+	delete(m.dialing, link.ID)
 	if err != nil {
 		m.mu.Unlock()
 		return fmt.Errorf("dial TCP %s: %w", address, err)
@@ -88,13 +122,20 @@ func (m *Manager) StartTCP(ctx context.Context, host string, port int) error {
 		_ = networkConnection.Close()
 		return ctx.Err()
 	}
-	if m.connection != nil {
+	if _, connected := m.connections[link.ID]; connected {
 		m.mu.Unlock()
 		_ = networkConnection.Close()
-		return ErrAlreadyConnected
+		return fmt.Errorf("%w: %d", ErrAlreadyConnected, link.ID)
 	}
-	active := &connection{Conn: networkConnection}
-	m.connection = active
+	active := &connection{
+		Conn:       networkConnection,
+		link:       link,
+		network:    "TCP",
+		remoteHost: remoteAddressHost(networkConnection.RemoteAddr(), host),
+		remotePort: port,
+		localPort:  addressPort(networkConnection.LocalAddr()),
+	}
+	m.connections[link.ID] = active
 	m.readers.Add(1)
 	m.mu.Unlock()
 
@@ -102,24 +143,51 @@ func (m *Manager) StartTCP(ctx context.Context, host string, port int) error {
 	return nil
 }
 
-func (m *Manager) Connected() bool {
+func (m *Manager) Connected(id int) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.connection != nil
+	_, connected := m.connections[id]
+	return connected
 }
 
-func (m *Manager) Send(payload []byte) error {
+func (m *Manager) Count() int {
 	m.mu.Lock()
-	active := m.connection
+	defer m.mu.Unlock()
+	return len(m.connections)
+}
+
+func (m *Manager) Statuses() []Status {
+	m.mu.Lock()
+	statuses := make([]Status, 0, len(m.connections))
+	for _, active := range m.connections {
+		statuses = append(statuses, Status{
+			ID:         active.link.ID,
+			Network:    active.network,
+			RemoteHost: active.remoteHost,
+			RemotePort: active.remotePort,
+			LocalPort:  active.localPort,
+		})
+	}
+	m.mu.Unlock()
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].ID < statuses[j].ID })
+	return statuses
+}
+
+func (m *Manager) Send(id int, payload []byte) error {
+	if err := validateID(id); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	active := m.connections[id]
 	m.mu.Unlock()
 	if active == nil || active.localClose.Load() {
-		return ErrNoConnection
+		return fmt.Errorf("%w: %d", ErrNoConnection, id)
 	}
 
 	active.writeMu.Lock()
 	defer active.writeMu.Unlock()
 	if active.localClose.Load() {
-		return ErrNoConnection
+		return fmt.Errorf("%w: %d", ErrNoConnection, id)
 	}
 
 	if m.writeTimeout > 0 {
@@ -135,13 +203,13 @@ func (m *Manager) Send(payload []byte) error {
 	return nil
 }
 
-// Close closes the active socket without generating a remote CLOSED event. It
-// reports whether a connection was present.
-func (m *Manager) Close() bool {
+// Close closes one active socket without generating a remote CLOSED event. It
+// reports whether the requested connection was present.
+func (m *Manager) Close(id int) bool {
 	m.mu.Lock()
-	active := m.connection
+	active := m.connections[id]
 	if active != nil {
-		m.connection = nil
+		delete(m.connections, id)
 		active.localClose.Store(true)
 	}
 	m.mu.Unlock()
@@ -152,9 +220,26 @@ func (m *Manager) Close() bool {
 	return true
 }
 
-// Wait waits for all socket reader goroutines to finish. Call Close first when
-// shutting down. It is separate from Close so command handlers never deadlock
-// with a receive callback that is waiting to enqueue UART output.
+// CloseAll closes every active socket without generating remote CLOSED events
+// and returns the number of connections that were closed.
+func (m *Manager) CloseAll() int {
+	m.mu.Lock()
+	activeConnections := make([]*connection, 0, len(m.connections))
+	for id, active := range m.connections {
+		delete(m.connections, id)
+		active.localClose.Store(true)
+		activeConnections = append(activeConnections, active)
+	}
+	m.mu.Unlock()
+	for _, active := range activeConnections {
+		_ = active.Conn.Close()
+	}
+	return len(activeConnections)
+}
+
+// Wait waits for all socket reader goroutines to finish. Call CloseAll first
+// when shutting down. It is separate so command handlers never deadlock with a
+// receive callback that is waiting to enqueue UART output.
 func (m *Manager) Wait() {
 	m.readers.Wait()
 }
@@ -166,11 +251,11 @@ func (m *Manager) readLoop(active *connection) {
 		n, err := active.Read(buffer)
 		if n > 0 {
 			payload := append([]byte(nil), buffer[:n]...)
-			m.events.Data(payload)
+			m.events.Data(active.link, payload)
 		}
 		if err != nil {
 			if !active.localClose.Load() && m.remove(active) {
-				m.events.Closed()
+				m.events.Closed(active.link)
 			}
 			return
 		}
@@ -180,11 +265,43 @@ func (m *Manager) readLoop(active *connection) {
 func (m *Manager) remove(active *connection) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.connection != active {
+	if m.connections[active.link.ID] != active {
 		return false
 	}
-	m.connection = nil
+	delete(m.connections, active.link.ID)
 	return true
+}
+
+func validateID(id int) error {
+	if id < MinConnectionID || id > MaxConnectionID {
+		return fmt.Errorf("%w: %d (expected %d-%d)", ErrInvalidID, id, MinConnectionID, MaxConnectionID)
+	}
+	return nil
+}
+
+func remoteAddressHost(address net.Addr, fallback string) string {
+	if address == nil {
+		return fallback
+	}
+	if host, _, err := net.SplitHostPort(address.String()); err == nil && host != "" {
+		return host
+	}
+	return fallback
+}
+
+func addressPort(address net.Addr) int {
+	if address == nil {
+		return 0
+	}
+	_, value, err := net.SplitHostPort(address.String())
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return port
 }
 
 func writeAll(writer io.Writer, payload []byte) error {

@@ -3,12 +3,15 @@ package esp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"nextnet/internal/sockets"
 )
 
 func TestEmulatorBasicCommandsAndEcho(t *testing.T) {
@@ -63,6 +66,22 @@ func TestEmulatorLogsCommandsAndRedactsCredentials(t *testing.T) {
 	}
 	if !strings.Contains(text, "AT unsupported") {
 		t.Fatalf("unsupported marker missing from log: %s", text)
+	}
+}
+
+func TestAsyncFramesUseConnectionFramingMode(t *testing.T) {
+	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
+	emulator.mux = false
+	output := make(chan []byte, 2)
+	link := sockets.Link{ID: 0, Multiplexed: true}
+
+	emulator.emitIPD(context.Background(), output, link, []byte("DATA"))
+	emulator.emitClosed(context.Background(), output, link)
+	if got := string(<-output); got != "+IPD,0,4:DATA" {
+		t.Fatalf("delayed mux IPD = %q", got)
+	}
+	if got := string(<-output); got != "\r\n0,CLOSED\r\n" {
+		t.Fatalf("delayed mux close = %q", got)
 	}
 }
 
@@ -156,6 +175,194 @@ func TestEmulatorSingleConnectionTCP(t *testing.T) {
 	}
 }
 
+func TestEmulatorMultiplexedTCP(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	type acceptedConnection struct {
+		address string
+		conn    net.Conn
+	}
+	serverConnections := make(chan acceptedConnection, 2)
+	dialer := espDialerFunc(func(_ context.Context, network, address string) (net.Conn, error) {
+		if network != "tcp" {
+			t.Fatalf("network = %q, want tcp", network)
+		}
+		client, server := net.Pipe()
+		serverConnections <- acceptedConnection{address: address, conn: server}
+		return client, nil
+	})
+
+	emulatorSide, clientSide := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- New(logger, Config{Version: "test", Baud: 115200, Dialer: dialer}).Serve(ctx, emulatorSide)
+	}()
+
+	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSTATUS\r\n", "\r\nSTATUS:2\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX=1\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX?\r\n", "\r\n+CIPMUX:1\r\n\r\nOK\r\n")
+
+	testExchange(t, clientSide, `AT+CIPSTART=2,"TCP","two.test",2002`+"\r\n", "\r\n2,CONNECT\r\n\r\nOK\r\n")
+	peer2 := <-serverConnections
+	if peer2.address != "two.test:2002" {
+		t.Fatalf("ID 2 dialed %q", peer2.address)
+	}
+	testExchange(t, clientSide, `AT+CIPSTART=4,"TCP","four.test",4004`+"\r\n", "\r\n4,CONNECT\r\n\r\nOK\r\n")
+	peer4 := <-serverConnections
+	if peer4.address != "four.test:4004" {
+		t.Fatalf("ID 4 dialed %q", peer4.address)
+	}
+
+	wantStatus := "\r\nSTATUS:3\r\n" +
+		`+CIPSTATUS:2,"TCP","two.test",2002,0,0` + "\r\n" +
+		`+CIPSTATUS:4,"TCP","four.test",4004,0,0` + "\r\n\r\nOK\r\n"
+	testExchange(t, clientSide, "AT+CIPSTATUS\r\n", wantStatus)
+	testExchange(t, clientSide, "AT+CIPMUX=0\r\n", "\r\nERROR\r\n")
+
+	payload := []byte{0x00, 0xff, 'T', 'W', 'O'}
+	received := make(chan []byte, 1)
+	go func() {
+		got := make([]byte, len(payload))
+		_, _ = io.ReadFull(peer2.conn, got)
+		received <- got
+	}()
+	if err := clientSide.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	commandAndPayload := append([]byte("AT+CIPSEND=2,5\r\n"), payload...)
+	if _, err := clientSide.Write(commandAndPayload); err != nil {
+		t.Fatal(err)
+	}
+	wantSend := "\r\nOK\r\n>\r\nSEND OK\r\n"
+	gotSend := make([]byte, len(wantSend))
+	if _, err := io.ReadFull(clientSide, gotSend); err != nil {
+		t.Fatal(err)
+	}
+	if string(gotSend) != wantSend {
+		t.Fatalf("mux send output = %q, want %q", gotSend, wantSend)
+	}
+	if gotPayload := <-received; !bytes.Equal(gotPayload, payload) {
+		t.Fatalf("ID 2 payload = %v, want %v", gotPayload, payload)
+	}
+
+	go func() { _, _ = peer4.conn.Write([]byte("FOUR")) }()
+	readExact(t, clientSide, "+IPD,4,4:FOUR")
+	_ = peer4.conn.Close()
+	readExact(t, clientSide, "\r\n4,CLOSED\r\n")
+
+	testExchange(t, clientSide, "AT+CIPCLOSE=2\r\n", "\r\n2,CLOSED\r\n\r\nOK\r\n")
+	_ = peer2.conn.Close()
+	testExchange(t, clientSide, "AT+CIPSTATUS\r\n", "\r\nSTATUS:2\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX=0\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX?\r\n", "\r\n+CIPMUX:0\r\n\r\nOK\r\n")
+
+	cancel()
+	_ = clientSide.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop after multiplexed exchange")
+	}
+
+	logText := logs.String()
+	for _, fragment := range []string{"id=2", "id=4", "CIPSEND payload received", "socket received"} {
+		if !strings.Contains(logText, fragment) {
+			t.Fatalf("mux log is missing %q: %s", fragment, logText)
+		}
+	}
+}
+
+func TestEmulatorRejectsConnectionSyntaxForWrongMuxMode(t *testing.T) {
+	serverConnections := make(chan net.Conn, 1)
+	dialer := espDialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		serverConnections <- server
+		return client, nil
+	})
+	emulatorSide, clientSide := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{Dialer: dialer}).Serve(ctx, emulatorSide)
+	}()
+
+	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, `AT+CIPSTART=0,"TCP","wrong.test",80`+"\r\n", "\r\nERROR\r\n")
+	testExchange(t, clientSide, "AT+CIPSEND=0,1\r\n", "\r\nERROR\r\n")
+	testExchange(t, clientSide, "AT+CIPCLOSE=0\r\n", "\r\nERROR\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX=1\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, `AT+CIPSTART="TCP","wrong.test",80`+"\r\n", "\r\nERROR\r\n")
+	testExchange(t, clientSide, "AT+CIPSEND=1\r\n", "\r\nERROR\r\n")
+	testExchange(t, clientSide, "AT+CIPCLOSE\r\n", "\r\nERROR\r\n")
+	testExchange(t, clientSide, `AT+CIPSTART=0,"TCP","right.test",80`+"\r\n", "\r\n0,CONNECT\r\n\r\nOK\r\n")
+	peer := <-serverConnections
+	testExchange(t, clientSide, `AT+CIPSTART=0,"TCP","duplicate.test",80`+"\r\n", "\r\nERROR\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX=0\r\n", "\r\nERROR\r\n")
+	testExchange(t, clientSide, "AT+CIPCLOSE=0\r\n", "\r\n0,CLOSED\r\n\r\nOK\r\n")
+	_ = peer.Close()
+
+	cancel()
+	_ = clientSide.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop")
+	}
+}
+
+func TestEmulatorResetClosesEveryMultiplexedSocket(t *testing.T) {
+	serverConnections := make(chan net.Conn, 2)
+	dialer := espDialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		serverConnections <- server
+		return client, nil
+	})
+	emulatorSide, clientSide := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{Dialer: dialer}).Serve(ctx, emulatorSide)
+	}()
+
+	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX=1\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, `AT+CIPSTART=0,"TCP","zero.test",80`+"\r\n", "\r\n0,CONNECT\r\n\r\nOK\r\n")
+	peer0 := <-serverConnections
+	testExchange(t, clientSide, `AT+CIPSTART=4,"TCP","four.test",80`+"\r\n", "\r\n4,CONNECT\r\n\r\nOK\r\n")
+	peer4 := <-serverConnections
+
+	testExchange(t, clientSide, "AT+RST\r\n", "\r\nOK\r\nWIFI CONNECTED\r\nWIFI GOT IP\r\n\r\nready\r\n")
+	for id, peer := range map[int]net.Conn{0: peer0, 4: peer4} {
+		buffer := make([]byte, 1)
+		if _, err := peer.Read(buffer); !errors.Is(err, io.EOF) {
+			t.Fatalf("peer %d read after reset = %v, want EOF", id, err)
+		}
+		_ = peer.Close()
+	}
+	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX?\r\n", "\r\n+CIPMUX:0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSTATUS\r\n", "\r\nSTATUS:2\r\n\r\nOK\r\n")
+
+	cancel()
+	_ = clientSide.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop")
+	}
+}
+
 func TestEmulatorCancellationInterruptsBlockedSocketSend(t *testing.T) {
 	serverConnections := make(chan net.Conn, 1)
 	dialer := espDialerFunc(func(context.Context, string, string) (net.Conn, error) {
@@ -209,6 +416,20 @@ func testExchange(t *testing.T, connection net.Conn, command, want string) {
 	}
 	if string(got) != want {
 		t.Fatalf("response to %q = %q, want %q", command, got, want)
+	}
+}
+
+func readExact(t *testing.T, connection net.Conn, want string) {
+	t.Helper()
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(connection, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("UART output = %q, want %q", got, want)
 	}
 }
 

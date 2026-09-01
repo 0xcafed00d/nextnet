@@ -58,20 +58,56 @@ func TestUARTCompatibilityCommands(t *testing.T) {
 }
 
 func TestParseCIPStart(t *testing.T) {
-	host, port, err := parseCIPStart(`AT+CIPSTART="TCP","example.com",8080`)
+	arguments, err := parseCIPStart(`AT+CIPSTART="TCP","example.com",8080`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if host != "example.com" || port != 8080 {
-		t.Fatalf("got host=%q port=%d", host, port)
+	if arguments.hasID || arguments.id != 0 || arguments.host != "example.com" || arguments.port != 8080 {
+		t.Fatalf("single arguments = %+v", arguments)
+	}
+	arguments, err = parseCIPStart(`AT+CIPSTART=4,"TCP","mux.example",443`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !arguments.hasID || arguments.id != 4 || arguments.host != "mux.example" || arguments.port != 443 {
+		t.Fatalf("multiplexed arguments = %+v", arguments)
 	}
 	for _, command := range []string{
 		`AT+CIPSTART="UDP","example.com",80`,
 		`AT+CIPSTART="TCP","example.com",0`,
-		`AT+CIPSTART=0,"TCP","example.com",80`,
+		`AT+CIPSTART=5,"TCP","example.com",80`,
+		`AT+CIPSTART=0,1,"TCP","example.com",80`,
 	} {
-		if _, _, err := parseCIPStart(command); err == nil {
+		if _, err := parseCIPStart(command); err == nil {
 			t.Errorf("parseCIPStart(%q) succeeded", command)
+		}
+	}
+}
+
+func TestParseCIPSend(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		want    cipSendArguments
+	}{
+		{command: "AT+CIPSEND=12", want: cipSendArguments{id: 0, length: 12}},
+		{command: "AT+CIPSEND=3,4096", want: cipSendArguments{id: 3, hasID: true, length: 4096}},
+	} {
+		got, err := parseCIPSend(tc.command)
+		if err != nil {
+			t.Fatalf("parseCIPSend(%q): %v", tc.command, err)
+		}
+		if got != tc.want {
+			t.Fatalf("parseCIPSend(%q) = %+v, want %+v", tc.command, got, tc.want)
+		}
+	}
+	for _, command := range []string{
+		"AT+CIPSEND=0",
+		"AT+CIPSEND=-1",
+		"AT+CIPSEND=5,10",
+		"AT+CIPSEND=0,1,2",
+	} {
+		if _, err := parseCIPSend(command); err == nil {
+			t.Errorf("parseCIPSend(%q) succeeded", command)
 		}
 	}
 }

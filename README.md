@@ -4,8 +4,8 @@
 software running in the ZX Spectrum Next MiSTer core. It uses the core's UART0
 path and MiSTer's Linux networking stack.
 
-The UART path and basic AT stage are hardware-proven. The repository now also
-contains the host-tested single-connection TCP stage:
+The UART path and single-connection TCP stage are hardware-proven. The
+repository now also contains the host-tested multiplexed TCP stage:
 
 - exact active-core detection through `/tmp/CORENAME`
 - raw Linux serial setup (115200 8N1 by default)
@@ -17,14 +17,17 @@ contains the host-tested single-connection TCP stage:
 - virtual reset messages reporting `WIFI CONNECTED` and `WIFI GOT IP`
 - single-connection TCP through `CIPMUX=0`, `CIPSTART`, `CIPSEND`, and
   `CIPCLOSE`
+- up to five simultaneous TCP connections through `CIPMUX=1` and link IDs
+  `0` through `4`
 - fixed-length, binary-safe `CIPSEND` payload handling up to 64 KiB
-- asynchronous `+IPD` receive frames and `CLOSED` notifications
+- mux-aware `CONNECT`, `+IPD`, and `CLOSED` notifications
+- `CIPSTATUS` reporting for active connections
 - bounded socket-to-UART backpressure and clean socket shutdown
 - default console logging for every command, response, malformed line, and
   unsupported command
 - credential redaction for `AT+CWJAP*` commands
 
-Multiplexed sockets, UDP, and real Wi-Fi configuration are not implemented.
+UDP, inbound TCP servers, and real Wi-Fi configuration are not implemented.
 
 ## Verified MiSTer hardware
 
@@ -35,8 +38,13 @@ Testing on a real MiSTer with the ZXNext core established that:
 - no existing process owned `/dev/ttyS1` during the test.
 - raw 115200 baud decoded `\r\nAT\r\n` correctly.
 - ZXNext's `.uart` command exchanged data in both directions with Linux.
-- ZXDB-dl reached its `.http` initialization and exposed the UART and TCP
-  compatibility commands implemented in stage two.
+- ZXDB-dl successfully searched the database and downloaded a game through
+  `nextnet`.
+- GETIT also completed network downloads successfully.
+
+These applications prove the `CIPMUX=0` path on hardware. Multiplexed sockets
+remain host-tested until a suitable real Next application or UART fixture is
+run against them.
 
 The serial device remains configurable because this one-system result is not a
 guarantee for every MiSTer installation.
@@ -99,7 +107,7 @@ Example TCP logs:
 time=... level=INFO msg="AT <- AT+CIPSTART=\"TCP\",\"example.com\",80"
 time=... level=INFO msg="socket connected" id=0 network=tcp host=example.com port=80
 time=... level=INFO msg="AT <- AT+CIPSEND=18"
-time=... level=INFO msg="CIPSEND payload received" bytes=18
+time=... level=INFO msg="CIPSEND payload received" id=0 bytes=18
 time=... level=INFO msg="socket sent" id=0 bytes=18
 time=... level=INFO msg="socket received" id=0 bytes=512
 ```
@@ -139,9 +147,16 @@ AT+UART=115200,8,1,0,0
 
 AT+CIPMUX?
 AT+CIPMUX=0
+AT+CIPMUX=1
+AT+CIPSTATUS
+
 AT+CIPSTART="TCP","host",port
 AT+CIPSEND=length
 AT+CIPCLOSE
+
+AT+CIPSTART=id,"TCP","host",port
+AT+CIPSEND=id,length
+AT+CIPCLOSE=id
 ```
 
 UART setters are accepted only when they match the daemon's configured fixed
@@ -168,7 +183,8 @@ Switch away from ZXNext and verify the log reports:
 serial closed; bridge idle
 ```
 
-For the TCP stage, run ZXDB-dl again. Its initialization should now pass
-`ATE0`, `AT+CIPCLOSE`, and `AT+CIPMUX=0`, then proceed to a logged
-`AT+CIPSTART`. A successful request should subsequently log `CIPSEND` payload
-lengths and incoming socket byte counts while ZXNext receives `+IPD` frames.
+ZXDB-dl and GETIT are the current `CIPMUX=0` regression applications. A mux
+acceptance run should open two IDs, send data independently with
+`AT+CIPSEND=id,length`, and verify incoming frames use
+`+IPD,id,length:<payload>`. Leaving ZXNext must close both sockets and return
+the daemon to its idle state.
