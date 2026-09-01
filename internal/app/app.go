@@ -148,7 +148,10 @@ func (a *App) startSession(parent context.Context) (*session, error) {
 
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan error, 1)
-	emulator := esp.New(a.logger, version.String())
+	emulator := esp.New(a.logger, esp.Config{
+		Version: version.String(),
+		Baud:    a.config.Baud,
+	})
 	go func() {
 		done <- emulator.Serve(ctx, port)
 	}()

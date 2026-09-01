@@ -6,12 +6,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"strconv"
+	"sync"
+	"time"
+
+	"nextnet/internal/sockets"
 )
 
 const (
-	maximumATLine = 4096
-	outputFrames  = 64
+	maximumATLine       = 4096
+	defaultMaxSendSize  = 64 * 1024
+	outputFrames        = 64
+	defaultDialTimeout  = 10 * time.Second
+	defaultWriteTimeout = 10 * time.Second
 )
 
 type Transport interface {
@@ -20,29 +28,73 @@ type Transport interface {
 	io.Closer
 }
 
-type Emulator struct {
-	logger  *slog.Logger
-	version string
-	echo    bool
+type Config struct {
+	Version      string
+	Baud         int
+	Dialer       sockets.Dialer
+	DialTimeout  time.Duration
+	WriteTimeout time.Duration
+	MaxSendSize  int
 }
 
-func New(logger *slog.Logger, emulatorVersion string) *Emulator {
+type Emulator struct {
+	logger          *slog.Logger
+	config          Config
+	echo            bool
+	mux             bool
+	payloadExpected int
+	payload         []byte
+	outputMu        sync.Mutex
+	socketManager   *sockets.Manager
+}
+
+func New(logger *slog.Logger, config Config) *Emulator {
+	if config.Version == "" {
+		config.Version = "dev"
+	}
+	if config.Baud <= 0 {
+		config.Baud = 115200
+	}
+	if config.DialTimeout <= 0 {
+		config.DialTimeout = defaultDialTimeout
+	}
+	if config.WriteTimeout <= 0 {
+		config.WriteTimeout = defaultWriteTimeout
+	}
+	if config.MaxSendSize <= 0 {
+		config.MaxSendSize = defaultMaxSendSize
+	}
+	if config.Dialer == nil {
+		config.Dialer = &net.Dialer{
+			Timeout:   config.DialTimeout,
+			KeepAlive: 30 * time.Second,
+		}
+	}
 	return &Emulator{
-		logger:  logger,
-		version: emulatorVersion,
-		echo:    true,
+		logger: logger,
+		config: config,
+		echo:   true,
 	}
 }
 
 // Serve processes AT commands until the transport closes or the context is
-// canceled. Every UART write passes through one bounded queue and one writer
-// goroutine so future asynchronous socket frames cannot interleave responses.
+// canceled. Synchronous responses and asynchronous socket events all pass
+// through one bounded queue and one writer goroutine.
 func (e *Emulator) Serve(ctx context.Context, transport Transport) error {
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer transport.Close()
 
 	output := make(chan []byte, outputFrames)
+	e.socketManager = sockets.New(e.config.Dialer, sockets.Events{
+		Data: func(payload []byte) {
+			e.emitIPD(serveCtx, output, payload)
+		},
+		Closed: func() {
+			e.emitClosed(serveCtx, output)
+		},
+	}, e.config.WriteTimeout)
+
 	writerDone := make(chan error, 1)
 	go func() {
 		err := writeLoop(serveCtx, transport, output)
@@ -57,6 +109,7 @@ func (e *Emulator) Serve(ctx context.Context, transport Transport) error {
 	go func() {
 		select {
 		case <-serveCtx.Done():
+			e.socketManager.Close()
 			_ = transport.Close()
 		case <-closeOnCancelDone:
 		}
@@ -70,10 +123,22 @@ readLoop:
 	for {
 		n, err := transport.Read(buffer)
 		if n > 0 {
-			for _, event := range parser.feed(buffer[:n]) {
-				if processErr := e.processEvent(serveCtx, output, event); processErr != nil {
-					readErr = processErr
-					break readLoop
+			for _, value := range buffer[:n] {
+				if parser.consumePendingLF(value) {
+					continue
+				}
+				if e.payloadExpected > 0 {
+					if processErr := e.processPayloadByte(serveCtx, output, value); processErr != nil {
+						readErr = processErr
+						break readLoop
+					}
+					continue
+				}
+				if event := parser.feedByte(value); event != nil {
+					if processErr := e.processEvent(serveCtx, output, *event); processErr != nil {
+						readErr = processErr
+						break readLoop
+					}
 				}
 			}
 		}
@@ -84,7 +149,9 @@ readLoop:
 	}
 
 	cancel()
+	e.socketManager.Close()
 	_ = transport.Close()
+	e.socketManager.Wait()
 	close(output)
 	writerErr := <-writerDone
 	close(closeOnCancelDone)
@@ -102,6 +169,9 @@ readLoop:
 }
 
 func (e *Emulator) processEvent(ctx context.Context, output chan<- []byte, event parseEvent) error {
+	e.outputMu.Lock()
+	defer e.outputMu.Unlock()
+
 	if event.err != nil {
 		e.logger.Warn("AT malformed", "error", event.err)
 		if err := enqueue(ctx, output, responseError); err != nil {
@@ -124,19 +194,21 @@ func (e *Emulator) processEvent(ctx context.Context, output chan<- []byte, event
 	safeCommand := redactCommand(command)
 	e.logger.Info("AT <- " + safeCommand)
 
-	echoWasEnabled := e.echo
-	result := executeCommand(command, e.version)
-	if echoWasEnabled {
+	if e.echo {
 		echo := append(append([]byte(nil), event.line...), '\r', '\n')
 		if err := enqueue(ctx, output, echo); err != nil {
 			return err
 		}
 	}
 
-	if result.supported {
-		e.logger.Info("AT supported", "command", safeCommand)
-	} else {
+	result := e.executeCommand(ctx, command)
+	switch {
+	case !result.known:
 		e.logger.Warn("AT unsupported", "command", safeCommand)
+	case result.rejected != "":
+		e.logger.Warn("AT rejected", "command", safeCommand, "reason", result.rejected)
+	default:
+		e.logger.Info("AT supported", "command", safeCommand)
 	}
 	if err := enqueue(ctx, output, result.response); err != nil {
 		return err
@@ -144,11 +216,75 @@ func (e *Emulator) processEvent(ctx context.Context, output chan<- []byte, event
 	e.logger.Info("AT -> " + result.responseLog)
 
 	if result.reset {
-		e.echo = true
+		e.resetState()
 	} else if result.setEcho != nil {
 		e.echo = *result.setEcho
 	}
+	if result.payloadLength > 0 {
+		e.payloadExpected = result.payloadLength
+		e.payload = make([]byte, 0, result.payloadLength)
+	}
 	return nil
+}
+
+func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- []byte, value byte) error {
+	e.payload = append(e.payload, value)
+	if len(e.payload) < e.payloadExpected {
+		return nil
+	}
+
+	payload := e.payload
+	e.payload = nil
+	e.payloadExpected = 0
+	e.logger.Info("CIPSEND payload received", "bytes", len(payload))
+
+	e.outputMu.Lock()
+	defer e.outputMu.Unlock()
+	if err := e.socketManager.Send(payload); err != nil {
+		e.logger.Warn("socket send failed", "bytes", len(payload), "error", err)
+		if enqueueErr := enqueue(ctx, output, responseSendFail); enqueueErr != nil {
+			return enqueueErr
+		}
+		e.logger.Info("AT -> SEND FAIL")
+		return nil
+	}
+	if err := enqueue(ctx, output, responseSendOK); err != nil {
+		return err
+	}
+	e.logger.Info("socket sent", "id", 0, "bytes", len(payload))
+	e.logger.Info("AT -> SEND OK")
+	return nil
+}
+
+func (e *Emulator) emitIPD(ctx context.Context, output chan<- []byte, payload []byte) {
+	frame := make([]byte, 0, len(payload)+32)
+	frame = append(frame, "+IPD,"...)
+	frame = strconv.AppendInt(frame, int64(len(payload)), 10)
+	frame = append(frame, ':')
+	frame = append(frame, payload...)
+
+	e.outputMu.Lock()
+	err := enqueue(ctx, output, frame)
+	e.outputMu.Unlock()
+	if err == nil {
+		e.logger.Info("socket received", "id", 0, "bytes", len(payload))
+	}
+}
+
+func (e *Emulator) emitClosed(ctx context.Context, output chan<- []byte) {
+	e.outputMu.Lock()
+	err := enqueue(ctx, output, []byte("\r\nCLOSED\r\n"))
+	e.outputMu.Unlock()
+	if err == nil {
+		e.logger.Info("socket closed", "id", 0, "cause", "remote")
+	}
+}
+
+func (e *Emulator) resetState() {
+	e.echo = true
+	e.mux = false
+	e.payloadExpected = 0
+	e.payload = nil
 }
 
 func enqueue(ctx context.Context, output chan<- []byte, frame []byte) error {
