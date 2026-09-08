@@ -29,8 +29,12 @@ type Dialer interface {
 }
 
 type Link struct {
-	ID          int
-	Multiplexed bool
+	ID           int
+	Multiplexed  bool
+	RemoteHost   string
+	RemotePort   int
+	KeepAlive    int
+	HasKeepAlive bool
 }
 
 type Events struct {
@@ -110,6 +114,12 @@ func (m *Manager) StartTCP(ctx context.Context, link Link, host string, port int
 
 	address := net.JoinHostPort(host, strconv.Itoa(port))
 	networkConnection, err := m.dialer.DialContext(ctx, "tcp", address)
+	if err == nil {
+		if configureErr := configureTCPKeepAlive(networkConnection, link); configureErr != nil {
+			_ = networkConnection.Close()
+			err = configureErr
+		}
+	}
 
 	m.mu.Lock()
 	delete(m.dialing, link.ID)
@@ -135,11 +145,38 @@ func (m *Manager) StartTCP(ctx context.Context, link Link, host string, port int
 		remotePort: port,
 		localPort:  addressPort(networkConnection.LocalAddr()),
 	}
+	active.link.RemoteHost = active.remoteHost
+	active.link.RemotePort = active.remotePort
 	m.connections[link.ID] = active
 	m.readers.Add(1)
 	m.mu.Unlock()
 
 	go m.readLoop(active)
+	return nil
+}
+
+type tcpKeepAliveConnection interface {
+	SetKeepAlive(bool) error
+	SetKeepAlivePeriod(time.Duration) error
+}
+
+func configureTCPKeepAlive(networkConnection net.Conn, link Link) error {
+	if !link.HasKeepAlive {
+		return nil
+	}
+	tcpConnection, ok := networkConnection.(tcpKeepAliveConnection)
+	if !ok {
+		return nil
+	}
+	enabled := link.KeepAlive > 0
+	if err := tcpConnection.SetKeepAlive(enabled); err != nil {
+		return fmt.Errorf("configure TCP keepalive: %w", err)
+	}
+	if enabled {
+		if err := tcpConnection.SetKeepAlivePeriod(time.Duration(link.KeepAlive) * time.Second); err != nil {
+			return fmt.Errorf("configure TCP keepalive period: %w", err)
+		}
+	}
 	return nil
 }
 

@@ -85,6 +85,154 @@ func TestAsyncFramesUseConnectionFramingMode(t *testing.T) {
 	}
 }
 
+func TestCIPDInfoAddsRemoteEndpointToIPD(t *testing.T) {
+	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
+	emulator.cipdInfo = true
+	output := make(chan []byte, 1)
+	link := sockets.Link{ID: 3, Multiplexed: true, RemoteHost: "192.0.2.4", RemotePort: 8080}
+
+	emulator.emitIPD(context.Background(), output, link, []byte("DATA"))
+	if got := string(<-output); got != "+IPD,3,4,192.0.2.4,8080:DATA" {
+		t.Fatalf("CIPDINFO frame = %q", got)
+	}
+}
+
+func TestRemoteCloseLeavesTransparentMode(t *testing.T) {
+	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
+	emulator.transparentActive.Store(true)
+	output := make(chan []byte, 1)
+
+	emulator.emitClosed(context.Background(), output, sockets.Link{ID: 0})
+	if emulator.transparentActive.Load() {
+		t.Fatal("transparent mode remained active after remote close")
+	}
+	if got := string(<-output); got != "\r\nCLOSED\r\n" {
+		t.Fatalf("remote close frame = %q", got)
+	}
+}
+
+func TestTransparentEscapeRequiresGuardIntervals(t *testing.T) {
+	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
+	start := time.Unix(100, 0)
+	emulator.transparentActive.Store(true)
+	emulator.transparentLastByte = start
+	payload := make([]byte, 0, 8)
+
+	// Three pluses immediately following payload remain ordinary data.
+	for index, value := range []byte("A+++") {
+		consumed, escaped := emulator.consumeTransparentByte(value, &payload, start.Add(time.Duration(index+1)*time.Millisecond))
+		if !consumed || escaped {
+			t.Fatalf("ordinary byte %d = consumed %v escaped %v", index, consumed, escaped)
+		}
+	}
+	if got := string(payload); got != "A+++" {
+		t.Fatalf("ordinary plus payload = %q", got)
+	}
+
+	payload = payload[:0]
+	firstPlus := start.Add(50 * time.Millisecond)
+	for index := 0; index < 3; index++ {
+		consumed, escaped := emulator.consumeTransparentByte('+', &payload, firstPlus.Add(time.Duration(index)*time.Millisecond))
+		if !consumed || escaped {
+			t.Fatalf("escape plus %d = consumed %v escaped %v", index, consumed, escaped)
+		}
+	}
+	consumed, escaped := emulator.consumeTransparentByte('A', &payload, firstPlus.Add(30*time.Millisecond))
+	if consumed || !escaped || emulator.transparentActive.Load() {
+		t.Fatalf("guarded escape = consumed %v escaped %v active %v", consumed, escaped, emulator.transparentActive.Load())
+	}
+	if len(payload) != 0 {
+		t.Fatalf("escape sequence leaked into payload: %q", payload)
+	}
+}
+
+func TestEmulatorTransparentTCP(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	serverConnections := make(chan net.Conn, 1)
+	dialer := espDialerFunc(func(_ context.Context, network, address string) (net.Conn, error) {
+		if network != "tcp" || address != "bbs.zxnext.uk:2323" {
+			t.Fatalf("dial = %q %q, want tcp bbs.zxnext.uk:2323", network, address)
+		}
+		client, server := net.Pipe()
+		serverConnections <- server
+		return client, nil
+	})
+
+	emulatorSide, clientSide := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- New(logger, Config{Version: "test", Baud: 115200, Dialer: dialer}).Serve(ctx, emulatorSide)
+	}()
+
+	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPDINFO=0\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPRECVMODE=1\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPRECVMODE?\r\n", "\r\n+CIPRECVMODE:1\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX=0\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMODE=1\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, `AT+CIPSTART="TCP","bbs.zxnext.uk",2323,1`+"\r\n", "\r\nCONNECT\r\n\r\nOK\r\n")
+	server := <-serverConnections
+	defer server.Close()
+
+	// CIPMODE=1 enables transparent receiving even before bare CIPSEND turns
+	// on transparent UART-to-socket transmission.
+	go func() { _, _ = server.Write([]byte("PRE")) }()
+	readExact(t, clientSide, "PRE")
+	testExchange(t, clientSide, "AT+CIPSEND\r\n", "\r\nOK\r\n>")
+
+	go func() { _, _ = server.Write([]byte("WELCOME")) }()
+	readExact(t, clientSide, "WELCOME")
+
+	received := make(chan []byte, 1)
+	go func() {
+		payload := make([]byte, len("HELLO++X"))
+		_, _ = io.ReadFull(server, payload)
+		received <- payload
+	}()
+	if _, err := clientSide.Write([]byte("HELLO++")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientSide.Write([]byte("X")); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(<-received); got != "HELLO++X" {
+		t.Fatalf("transparent TCP payload = %q", got)
+	}
+
+	time.Sleep(transparentGuard + 5*time.Millisecond)
+	if _, err := clientSide.Write([]byte("+++")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(transparentGuard + 5*time.Millisecond)
+	go func() { _, _ = server.Write([]byte("AFTER")) }()
+	readExact(t, clientSide, "AFTER")
+	testExchange(t, clientSide, "AT+CIPMODE?\r\n", "\r\n+CIPMODE:1\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPCLOSE\r\n", "\r\nCLOSED\r\n\r\nOK\r\n")
+
+	cancel()
+	_ = clientSide.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop after transparent exchange")
+	}
+
+	logText := logs.String()
+	for _, fragment := range []string{"transparent mode entered", "transparent socket sent", "transparent=true", "transparent mode exited"} {
+		if !strings.Contains(logText, fragment) {
+			t.Fatalf("transparent log is missing %q: %s", fragment, logText)
+		}
+	}
+	if strings.Contains(logText, "WELCOME") || strings.Contains(logText, "HELLO") {
+		t.Fatalf("transparent payload leaked into logs: %s", logText)
+	}
+}
+
 func TestEmulatorSingleConnectionTCP(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))

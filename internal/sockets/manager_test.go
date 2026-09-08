@@ -203,6 +203,38 @@ func TestManagerLocalCloseSuppressesEvent(t *testing.T) {
 	manager.Wait()
 }
 
+func TestConfigureTCPKeepAlive(t *testing.T) {
+	connection := &keepAliveConn{}
+	if err := configureTCPKeepAlive(connection, Link{HasKeepAlive: true, KeepAlive: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if !connection.enabled || connection.period != 7*time.Second {
+		t.Fatalf("enabled = %v period = %v", connection.enabled, connection.period)
+	}
+	if err := configureTCPKeepAlive(connection, Link{HasKeepAlive: true, KeepAlive: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if connection.enabled {
+		t.Fatal("zero keepalive did not disable TCP keepalive")
+	}
+}
+
+type keepAliveConn struct {
+	net.Conn
+	enabled bool
+	period  time.Duration
+}
+
+func (connection *keepAliveConn) SetKeepAlive(enabled bool) error {
+	connection.enabled = enabled
+	return nil
+}
+
+func (connection *keepAliveConn) SetKeepAlivePeriod(period time.Duration) error {
+	connection.period = period
+	return nil
+}
+
 type dialerFunc func(context.Context, string, string) (net.Conn, error)
 
 func (function dialerFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {

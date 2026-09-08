@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -12,8 +13,11 @@ import (
 	"time"
 
 	"nextnet/internal/app"
+	"nextnet/internal/singleinstance"
 	"nextnet/internal/version"
 )
+
+const instanceLockPath = "/tmp/nextnet.lock"
 
 func main() {
 	var (
@@ -38,6 +42,17 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	instanceLock, err := singleinstance.Acquire(instanceLockPath)
+	if err != nil {
+		if errors.Is(err, singleinstance.ErrAlreadyRunning) {
+			logger.Error("nextnet already running", "lock_file", instanceLockPath)
+		} else {
+			logger.Error("single-instance lock failed", "lock_file", instanceLockPath, "error", err)
+		}
+		os.Exit(1)
+	}
+	defer instanceLock.Close()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

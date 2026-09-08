@@ -27,15 +27,18 @@ type commandResult struct {
 	rejected            string
 	setEcho             *bool
 	reset               bool
+	enterTransparent    bool
 	payloadLength       int
 	payloadConnectionID int
 }
 
 type cipStartArguments struct {
-	id    int
-	hasID bool
-	host  string
-	port  int
+	id           int
+	hasID        bool
+	host         string
+	port         int
+	keepAlive    int
+	hasKeepAlive bool
 }
 
 type cipSendArguments struct {
@@ -82,8 +85,38 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 		return e.executeCIPMux(false)
 	case "AT+CIPMUX=1":
 		return e.executeCIPMux(true)
+	case "AT+CIPDINFO?":
+		return modeQueryResult("CIPDINFO", e.cipdInfo)
+	case "AT+CIPDINFO=0":
+		e.cipdInfo = false
+		return accepted(responseOK, "OK")
+	case "AT+CIPDINFO=1":
+		e.cipdInfo = true
+		return accepted(responseOK, "OK")
+	case "AT+CIPRECVMODE?":
+		return modeQueryResult("CIPRECVMODE", e.passiveReceive)
+	case "AT+CIPRECVMODE=0":
+		e.passiveReceive = false
+		return accepted(responseOK, "OK")
+	case "AT+CIPRECVMODE=1":
+		e.passiveReceive = true
+		return accepted(responseOK, "OK")
+	case "AT+CIPMODE?":
+		return modeQueryResult("CIPMODE", e.transparentConfigured)
+	case "AT+CIPMODE=0":
+		e.transparentConfigured = false
+		e.transparentActive.Store(false)
+		return accepted(responseOK, "OK")
+	case "AT+CIPMODE=1":
+		if e.mux {
+			return rejected(responseError, "ERROR", "transparent mode requires CIPMUX=0")
+		}
+		e.transparentConfigured = true
+		return accepted(responseOK, "OK")
 	case "AT+CIPSTATUS":
 		return e.executeCIPStatus()
+	case "AT+CIPSEND":
+		return e.executeTransparentCIPSend()
 	case "AT+CIPCLOSE":
 		if e.mux {
 			return rejected(responseError, "ERROR", "multiplexed CIPCLOSE requires a connection ID")
@@ -102,6 +135,11 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 	}
 	if strings.HasPrefix(upper, "AT+CIPCLOSE=") {
 		return e.executeMuxCIPClose(command)
+	}
+	for _, prefix := range []string{"AT+CIPDINFO=", "AT+CIPRECVMODE=", "AT+CIPMODE="} {
+		if strings.HasPrefix(upper, prefix) {
+			return rejected(responseError, "ERROR", "mode must be 0 or 1")
+		}
 	}
 	return commandResult{response: responseError, responseLog: "ERROR"}
 }
@@ -136,6 +174,9 @@ func (e *Emulator) executeUARTCommand(command, upper string) (commandResult, boo
 }
 
 func (e *Emulator) executeCIPMux(enabled bool) commandResult {
+	if enabled && e.transparentConfigured {
+		return rejected(responseError, "ERROR", "CIPMUX=1 is incompatible with transparent mode")
+	}
 	if e.mux != enabled && e.socketManager != nil && e.socketManager.Count() > 0 {
 		return rejected(responseError, "ERROR", "cannot change CIPMUX while connections are active")
 	}
@@ -157,7 +198,14 @@ func (e *Emulator) executeCIPStart(ctx context.Context, command string) commandR
 	if e.socketManager == nil {
 		return rejected(responseError, "ERROR", "socket manager is unavailable")
 	}
-	link := sockets.Link{ID: arguments.id, Multiplexed: e.mux}
+	link := sockets.Link{
+		ID:           arguments.id,
+		Multiplexed:  e.mux,
+		RemoteHost:   arguments.host,
+		RemotePort:   arguments.port,
+		KeepAlive:    arguments.keepAlive,
+		HasKeepAlive: arguments.hasKeepAlive,
+	}
 	if err := e.socketManager.StartTCP(ctx, link, arguments.host, arguments.port); err != nil {
 		e.logger.Warn("socket connect failed",
 			"id", arguments.id,
@@ -172,8 +220,24 @@ func (e *Emulator) executeCIPStart(ctx context.Context, command string) commandR
 		"network", "tcp",
 		"host", arguments.host,
 		"port", arguments.port,
+		"keep_alive", arguments.keepAlive,
 	)
 	return accepted(connectionResponse(arguments.id, "CONNECT", e.mux), connectionResponseLog(arguments.id, "CONNECT", e.mux)+" + OK")
+}
+
+func (e *Emulator) executeTransparentCIPSend() commandResult {
+	if e.mux {
+		return rejected(responseError, "ERROR", "transparent mode requires CIPMUX=0")
+	}
+	if !e.transparentConfigured {
+		return rejected(responseError, "ERROR", "AT+CIPMODE=1 is required before bare CIPSEND")
+	}
+	if e.socketManager == nil || !e.socketManager.Connected(0) {
+		return rejected(responseError, "ERROR", "connection ID 0 is not active")
+	}
+	result := accepted(responseSendPrompt, "OK + prompt")
+	result.enterTransparent = true
+	return result
 }
 
 func (e *Emulator) executeCIPSend(command string) commandResult {
@@ -295,15 +359,34 @@ func parseCIPStart(command string) (cipStartArguments, error) {
 
 	arguments := cipStartArguments{id: 0}
 	protocolIndex := 0
-	if len(fields) == 4 {
+	keepAliveIndex := -1
+	switch len(fields) {
+	case 3:
+		// Single connection without TCP keepalive.
+	case 4:
+		// Four fields are ambiguous in ESP-AT: a numeric first field is a
+		// multiplexed link ID, while a protocol first field means the last
+		// field is the single-connection TCP keepalive interval.
+		if _, parseErr := strconv.Atoi(strings.TrimSpace(fields[0])); parseErr == nil {
+			arguments.hasID = true
+			arguments.id, err = parseConnectionID(strings.TrimSpace(fields[0]))
+			if err != nil {
+				return cipStartArguments{}, err
+			}
+			protocolIndex = 1
+		} else {
+			keepAliveIndex = 3
+		}
+	case 5:
 		arguments.hasID = true
 		arguments.id, err = parseConnectionID(strings.TrimSpace(fields[0]))
 		if err != nil {
 			return cipStartArguments{}, err
 		}
 		protocolIndex = 1
-	} else if len(fields) != 3 {
-		return cipStartArguments{}, fmt.Errorf("CIPSTART requires protocol, host, and port, with an ID only in multiplexed mode")
+		keepAliveIndex = 4
+	default:
+		return cipStartArguments{}, fmt.Errorf("CIPSTART requires protocol, host, and port, with optional link ID and TCP keepalive")
 	}
 
 	if !strings.EqualFold(strings.TrimSpace(fields[protocolIndex]), "TCP") {
@@ -316,6 +399,13 @@ func parseCIPStart(command string) (cipStartArguments, error) {
 	arguments.port, err = strconv.Atoi(strings.TrimSpace(fields[protocolIndex+2]))
 	if err != nil || arguments.port < 1 || arguments.port > 65535 {
 		return cipStartArguments{}, fmt.Errorf("invalid TCP port %q", fields[protocolIndex+2])
+	}
+	if keepAliveIndex >= 0 {
+		arguments.keepAlive, err = strconv.Atoi(strings.TrimSpace(fields[keepAliveIndex]))
+		if err != nil || arguments.keepAlive < 0 || arguments.keepAlive > 7200 {
+			return cipStartArguments{}, fmt.Errorf("TCP keepalive must be between 0 and 7200 seconds")
+		}
+		arguments.hasKeepAlive = true
 	}
 	return arguments, nil
 }
@@ -367,6 +457,15 @@ func connectionResponseLog(id int, event string, multiplexed bool) string {
 		return fmt.Sprintf("%d,%s", id, event)
 	}
 	return event
+}
+
+func modeQueryResult(name string, enabled bool) commandResult {
+	value := 0
+	if enabled {
+		value = 1
+	}
+	response := fmt.Sprintf("\r\n+%s:%d\r\n\r\nOK\r\n", name, value)
+	return accepted([]byte(response), fmt.Sprintf("+%s:%d + OK", name, value))
 }
 
 func accepted(response []byte, responseLog string) commandResult {

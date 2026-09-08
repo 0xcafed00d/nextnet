@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nextnet/internal/sockets"
@@ -20,6 +21,7 @@ const (
 	outputFrames        = 64
 	defaultDialTimeout  = 10 * time.Second
 	defaultWriteTimeout = 10 * time.Second
+	transparentGuard    = 20 * time.Millisecond
 )
 
 type Transport interface {
@@ -38,15 +40,22 @@ type Config struct {
 }
 
 type Emulator struct {
-	logger          *slog.Logger
-	config          Config
-	echo            bool
-	mux             bool
-	payloadExpected int
-	payloadSocketID int
-	payload         []byte
-	outputMu        sync.Mutex
-	socketManager   *sockets.Manager
+	logger                *slog.Logger
+	config                Config
+	echo                  bool
+	mux                   bool
+	cipdInfo              bool
+	passiveReceive        bool
+	transparentConfigured bool
+	transparentActive     atomic.Bool
+	transparentPluses     int
+	transparentLastByte   time.Time
+	transparentLastPlus   time.Time
+	payloadExpected       int
+	payloadSocketID       int
+	payload               []byte
+	outputMu              sync.Mutex
+	socketManager         *sockets.Manager
 }
 
 func New(logger *slog.Logger, config Config) *Emulator {
@@ -124,9 +133,24 @@ readLoop:
 	for {
 		n, err := transport.Read(buffer)
 		if n > 0 {
+			transparentPayload := make([]byte, 0, n)
 			for _, value := range buffer[:n] {
 				if parser.consumePendingLF(value) {
 					continue
+				}
+				if e.transparentActive.Load() {
+					consumed, escaped := e.consumeTransparentByte(value, &transparentPayload, time.Now())
+					if escaped {
+						e.sendTransparentPayload(transparentPayload)
+						transparentPayload = transparentPayload[:0]
+					}
+					if consumed {
+						continue
+					}
+				}
+				if e.transparentPluses > 0 {
+					// A remote close can leave an incomplete escape candidate.
+					e.transparentPluses = 0
 				}
 				if e.payloadExpected > 0 {
 					if processErr := e.processPayloadByte(serveCtx, output, value); processErr != nil {
@@ -142,6 +166,7 @@ readLoop:
 					}
 				}
 			}
+			e.sendTransparentPayload(transparentPayload)
 		}
 		if err != nil {
 			readErr = err
@@ -221,12 +246,85 @@ func (e *Emulator) processEvent(ctx context.Context, output chan<- []byte, event
 	} else if result.setEcho != nil {
 		e.echo = *result.setEcho
 	}
+	if result.enterTransparent {
+		e.transparentPluses = 0
+		e.transparentLastByte = time.Now()
+		e.transparentLastPlus = time.Time{}
+		e.transparentActive.Store(true)
+		e.logger.Info("transparent mode entered", "id", 0)
+	}
 	if result.payloadLength > 0 {
 		e.payloadExpected = result.payloadLength
 		e.payloadSocketID = result.payloadConnectionID
 		e.payload = make([]byte, 0, result.payloadLength)
 	}
 	return nil
+}
+
+// consumeTransparentByte collects raw UART bytes for socket ID 0. An ESP
+// escape requires a quiet interval around three closely spaced plus bytes. A
+// completed candidate is held until the next UART byte proves the trailing
+// guard interval; that next byte is then returned to the AT line parser.
+func (e *Emulator) consumeTransparentByte(value byte, payload *[]byte, now time.Time) (consumed, escaped bool) {
+	if e.transparentPluses == 3 {
+		if now.Sub(e.transparentLastPlus) > transparentGuard {
+			e.transparentPluses = 0
+			e.transparentActive.Store(false)
+			e.logger.Info("transparent mode exited", "cause", "escape sequence")
+			return false, true
+		}
+		e.appendTransparentPluses(payload)
+		e.transparentLastByte = e.transparentLastPlus
+	}
+
+	if value != '+' {
+		e.appendTransparentPluses(payload)
+		*payload = append(*payload, value)
+		e.transparentLastByte = now
+		return true, false
+	}
+
+	if e.transparentPluses == 0 {
+		if !e.transparentLastByte.IsZero() && now.Sub(e.transparentLastByte) <= transparentGuard {
+			*payload = append(*payload, value)
+			e.transparentLastByte = now
+			return true, false
+		}
+		e.transparentPluses = 1
+		e.transparentLastPlus = now
+		return true, false
+	}
+
+	if now.Sub(e.transparentLastPlus) < transparentGuard {
+		e.transparentPluses++
+		e.transparentLastPlus = now
+		return true, false
+	}
+
+	// A slow plus sequence is ordinary payload. The current plus begins a new
+	// candidate because it follows the previous byte by a full guard interval.
+	e.appendTransparentPluses(payload)
+	e.transparentPluses = 1
+	e.transparentLastPlus = now
+	return true, false
+}
+
+func (e *Emulator) appendTransparentPluses(payload *[]byte) {
+	for e.transparentPluses > 0 {
+		*payload = append(*payload, '+')
+		e.transparentPluses--
+	}
+}
+
+func (e *Emulator) sendTransparentPayload(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+	if err := e.socketManager.Send(0, payload); err != nil {
+		e.logger.Warn("transparent socket send failed", "id", 0, "bytes", len(payload), "error", err)
+		return
+	}
+	e.logger.Info("transparent socket sent", "id", 0, "bytes", len(payload))
 }
 
 func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- []byte, value byte) error {
@@ -262,25 +360,38 @@ func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- []byte,
 
 func (e *Emulator) emitIPD(ctx context.Context, output chan<- []byte, link sockets.Link, payload []byte) {
 	e.outputMu.Lock()
-	frame := make([]byte, 0, len(payload)+32)
-	frame = append(frame, "+IPD,"...)
-	if link.Multiplexed {
-		frame = strconv.AppendInt(frame, int64(link.ID), 10)
-		frame = append(frame, ',')
+	frame := append([]byte(nil), payload...)
+	// CIPMODE=1 selects passthrough receiving mode immediately. Bare CIPSEND
+	// separately enables passthrough transmission from UART to the socket.
+	transparent := e.transparentConfigured && link.ID == 0 && !link.Multiplexed
+	if !transparent {
+		frame = make([]byte, 0, len(payload)+64)
+		frame = append(frame, "+IPD,"...)
+		if link.Multiplexed {
+			frame = strconv.AppendInt(frame, int64(link.ID), 10)
+			frame = append(frame, ',')
+		}
+		frame = strconv.AppendInt(frame, int64(len(payload)), 10)
+		if e.cipdInfo {
+			frame = append(frame, ',')
+			frame = append(frame, link.RemoteHost...)
+			frame = append(frame, ',')
+			frame = strconv.AppendInt(frame, int64(link.RemotePort), 10)
+		}
+		frame = append(frame, ':')
+		frame = append(frame, payload...)
 	}
-	frame = strconv.AppendInt(frame, int64(len(payload)), 10)
-	frame = append(frame, ':')
-	frame = append(frame, payload...)
 
 	err := enqueue(ctx, output, frame)
 	e.outputMu.Unlock()
 	if err == nil {
-		e.logger.Info("socket received", "id", link.ID, "bytes", len(payload))
+		e.logger.Info("socket received", "id", link.ID, "bytes", len(payload), "transparent", transparent)
 	}
 }
 
 func (e *Emulator) emitClosed(ctx context.Context, output chan<- []byte, link sockets.Link) {
 	e.outputMu.Lock()
+	wasTransparent := e.transparentActive.Swap(false)
 	frame := []byte("\r\nCLOSED\r\n")
 	if link.Multiplexed {
 		frame = []byte(fmt.Sprintf("\r\n%d,CLOSED\r\n", link.ID))
@@ -288,13 +399,20 @@ func (e *Emulator) emitClosed(ctx context.Context, output chan<- []byte, link so
 	err := enqueue(ctx, output, frame)
 	e.outputMu.Unlock()
 	if err == nil {
-		e.logger.Info("socket closed", "id", link.ID, "cause", "remote")
+		e.logger.Info("socket closed", "id", link.ID, "cause", "remote", "transparent", wasTransparent)
 	}
 }
 
 func (e *Emulator) resetState() {
 	e.echo = true
 	e.mux = false
+	e.cipdInfo = false
+	e.passiveReceive = false
+	e.transparentConfigured = false
+	e.transparentActive.Store(false)
+	e.transparentPluses = 0
+	e.transparentLastByte = time.Time{}
+	e.transparentLastPlus = time.Time{}
 	e.payloadExpected = 0
 	e.payloadSocketID = 0
 	e.payload = nil

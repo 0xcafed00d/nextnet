@@ -4,8 +4,9 @@
 software running in the ZX Spectrum Next MiSTer core. It uses the core's UART0
 path and MiSTer's Linux networking stack.
 
-The UART path and single-connection TCP stage are hardware-proven. The
-repository now also contains the host-tested multiplexed TCP stage:
+The UART path and fixed-length single-connection TCP stage are hardware-proven.
+The repository now also contains host-tested multiplexed and transparent TCP
+stages:
 
 - exact active-core detection through `/tmp/CORENAME`
 - raw Linux serial setup (115200 8N1 by default)
@@ -20,6 +21,10 @@ repository now also contains the host-tested multiplexed TCP stage:
 - up to five simultaneous TCP connections through `CIPMUX=1` and link IDs
   `0` through `4`
 - fixed-length, binary-safe `CIPSEND` payload handling up to 64 KiB
+- single-connection transparent TCP through `CIPMODE=1` and bare `CIPSEND`
+- raw bidirectional UART/TCP forwarding with `+++` escape handling
+- optional `CIPSTART` TCP keepalive intervals
+- `CIPDINFO` and `CIPRECVMODE` initialization compatibility
 - mux-aware `CONNECT`, `+IPD`, and `CLOSED` notifications
 - `CIPSTATUS` reporting for active connections
 - bounded socket-to-UART backpressure and clean socket shutdown
@@ -27,7 +32,8 @@ repository now also contains the host-tested multiplexed TCP stage:
   unsupported command
 - credential redaction for `AT+CWJAP*` commands
 
-UDP, inbound TCP servers, and real Wi-Fi configuration are not implemented.
+UDP, inbound TCP servers, passive `CIPRECVDATA` buffering, and real Wi-Fi
+configuration are not implemented.
 
 ## Verified MiSTer hardware
 
@@ -57,6 +63,7 @@ Requirements: Go 1.22 or later.
 make test
 make build
 make build-mister
+make package-mister
 ```
 
 The MiSTer build is a stripped, CGO-free Linux ARMv7 executable at:
@@ -65,12 +72,56 @@ The MiSTer build is a stripped, CGO-free Linux ARMv7 executable at:
 dist/nextnet-linux-armv7
 ```
 
-## Run on MiSTer
+`make package-mister` creates an installable archive and checksum:
 
-Copy the ARMv7 executable to MiSTer, make it executable, and run it as root:
+```text
+dist/nextnet-mister-armv7.tar.gz
+dist/nextnet-mister-armv7.tar.gz.sha256
+```
+
+## Install on MiSTer
+
+Copy the package to MiSTer, extract it, and run the installer as root:
 
 ```sh
-/media/fat/nextnet/nextnet -device /dev/ttyS1 -baud 115200
+sha256sum -c nextnet-mister-armv7.tar.gz.sha256
+tar -xzf nextnet-mister-armv7.tar.gz
+cd nextnet-mister
+./install.sh
+```
+
+The installer can safely be run again to update the binary. It:
+
+- installs nextnet under `/media/fat/linux/nextnet`
+- preserves unrelated contents of `/media/fat/linux/user-startup.sh`
+- adds exactly one marked automatic-startup block
+- saves the original startup file as `user-startup.sh.nextnet.bak` the first
+  time it edits an existing file
+- starts the daemon immediately unless it is already running
+
+At subsequent MiSTer boots, `user-startup.sh` launches:
+
+```sh
+/media/fat/linux/nextnet/nextnet -device /dev/ttyS1 -baud 115200
+```
+
+Output is redirected to the volatile `/tmp/nextnet.log`, avoiding continuous
+writes to the SD card. The daemon holds `/tmp/nextnet.lock`, so manual or
+duplicate startup attempts cannot own the UART simultaneously.
+
+To remove nextnet and only its marked startup block, run:
+
+```sh
+/media/fat/linux/nextnet/uninstall.sh
+```
+
+## Run manually on MiSTer
+
+For development, copy the ARMv7 executable to MiSTer, make it executable, and
+run it as root:
+
+```sh
+/media/fat/linux/nextnet/nextnet -device /dev/ttyS1 -baud 115200
 ```
 
 The `-device` option can be omitted to auto-select `/dev/ttyS1` when it exists.
@@ -110,6 +161,9 @@ time=... level=INFO msg="AT <- AT+CIPSEND=18"
 time=... level=INFO msg="CIPSEND payload received" id=0 bytes=18
 time=... level=INFO msg="socket sent" id=0 bytes=18
 time=... level=INFO msg="socket received" id=0 bytes=512
+time=... level=INFO msg="transparent mode entered" id=0
+time=... level=INFO msg="transparent socket sent" id=0 bytes=24
+time=... level=INFO msg="transparent mode exited" cause="escape sequence"
 ```
 
 Available options:
@@ -150,14 +204,41 @@ AT+CIPMUX=0
 AT+CIPMUX=1
 AT+CIPSTATUS
 
+AT+CIPDINFO?
+AT+CIPDINFO=0
+AT+CIPDINFO=1
+AT+CIPRECVMODE?
+AT+CIPRECVMODE=0
+AT+CIPRECVMODE=1
+AT+CIPMODE?
+AT+CIPMODE=0
+AT+CIPMODE=1
+
 AT+CIPSTART="TCP","host",port
+AT+CIPSTART="TCP","host",port,keepalive_seconds
 AT+CIPSEND=length
+AT+CIPSEND
 AT+CIPCLOSE
 
 AT+CIPSTART=id,"TCP","host",port
+AT+CIPSTART=id,"TCP","host",port,keepalive_seconds
 AT+CIPSEND=id,length
 AT+CIPCLOSE=id
 ```
+
+With `CIPMUX=0`, `CIPMODE=1` enables transparent receiving for an active TCP
+connection, so TCP bytes reach UART without AT framing. Bare `AT+CIPSEND`
+returns a prompt and also enables transparent UART-to-TCP transmission.
+Sending exactly `+++` with the ESP guard intervals (more than 20 ms before and
+after it, and less than 20 ms between pluses) exits transparent transmission
+without forwarding those three bytes. AT commands can then be used again while
+TCP-to-UART reception remains transparent.
+
+`CIPRECVMODE=0/1` is stored and reported so applications can complete their
+initialization. Passive receive buffering and `CIPRECVDATA` are not yet
+implemented; `CIPMODE=1` uses transparent raw reception, and normal mode keeps
+using unsolicited `+IPD` frames. `CIPDINFO=1` adds the remote address and port
+to normal-mode `+IPD` headers.
 
 UART setters are accepted only when they match the daemon's configured fixed
 baud and raw 8N1/no-flow-control settings. This avoids claiming a baud change
@@ -187,4 +268,5 @@ ZXDB-dl and GETIT are the current `CIPMUX=0` regression applications. A mux
 acceptance run should open two IDs, send data independently with
 `AT+CIPSEND=id,length`, and verify incoming frames use
 `+IPD,id,length:<payload>`. Leaving ZXNext must close both sockets and return
-the daemon to its idle state.
+the daemon to its idle state. The observed NXTEL transparent-mode command
+sequence is covered by host tests and remains to be verified on MiSTer.

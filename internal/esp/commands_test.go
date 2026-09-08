@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +58,41 @@ func TestUARTCompatibilityCommands(t *testing.T) {
 	}
 }
 
+func TestTransmissionCompatibilityModes(t *testing.T) {
+	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
+	for _, command := range []string{
+		"AT+CIPDINFO=0",
+		"AT+CIPDINFO=1",
+		"AT+CIPRECVMODE=0",
+		"AT+CIPRECVMODE=1",
+		"AT+CIPMODE=0",
+		"AT+CIPMODE=1",
+	} {
+		result := emulator.executeCommand(context.Background(), command)
+		if !result.known || result.rejected != "" {
+			t.Errorf("%s result = known %v rejected %q", command, result.known, result.rejected)
+		}
+	}
+	for _, command := range []string{"AT+CIPDINFO?", "AT+CIPRECVMODE?", "AT+CIPMODE?"} {
+		result := emulator.executeCommand(context.Background(), command)
+		if !result.known || result.rejected != "" || !strings.Contains(string(result.response), ":1") {
+			t.Errorf("%s result = %+v", command, result)
+		}
+	}
+	for _, command := range []string{"AT+CIPDINFO=2", "AT+CIPRECVMODE=-1", "AT+CIPMODE=YES"} {
+		result := emulator.executeCommand(context.Background(), command)
+		if !result.known || result.rejected == "" {
+			t.Errorf("invalid mode command %s was not rejected: %+v", command, result)
+		}
+	}
+
+	emulator.mux = true
+	result := emulator.executeCommand(context.Background(), "AT+CIPMODE=1")
+	if !result.known || result.rejected == "" {
+		t.Fatalf("transparent mode with CIPMUX=1 was not rejected: %+v", result)
+	}
+}
+
 func TestParseCIPStart(t *testing.T) {
 	arguments, err := parseCIPStart(`AT+CIPSTART="TCP","example.com",8080`)
 	if err != nil {
@@ -72,9 +108,25 @@ func TestParseCIPStart(t *testing.T) {
 	if !arguments.hasID || arguments.id != 4 || arguments.host != "mux.example" || arguments.port != 443 {
 		t.Fatalf("multiplexed arguments = %+v", arguments)
 	}
+	arguments, err = parseCIPStart(`AT+CIPSTART="TCP","bbs.zxnext.uk",2323,1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if arguments.hasID || !arguments.hasKeepAlive || arguments.keepAlive != 1 || arguments.host != "bbs.zxnext.uk" || arguments.port != 2323 {
+		t.Fatalf("single keepalive arguments = %+v", arguments)
+	}
+	arguments, err = parseCIPStart(`AT+CIPSTART=2,"TCP","mux.example",443,60`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !arguments.hasID || arguments.id != 2 || !arguments.hasKeepAlive || arguments.keepAlive != 60 {
+		t.Fatalf("multiplexed keepalive arguments = %+v", arguments)
+	}
 	for _, command := range []string{
 		`AT+CIPSTART="UDP","example.com",80`,
 		`AT+CIPSTART="TCP","example.com",0`,
+		`AT+CIPSTART="TCP","example.com",80,-1`,
+		`AT+CIPSTART="TCP","example.com",80,7201`,
 		`AT+CIPSTART=5,"TCP","example.com",80`,
 		`AT+CIPSTART=0,1,"TCP","example.com",80`,
 	} {
