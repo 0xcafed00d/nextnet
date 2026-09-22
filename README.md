@@ -14,7 +14,8 @@ stages:
 - immediate UART shutdown for every other core name, including alternative
   launcher values
 - serialized, bounded UART output
-- ESP basic and fixed-115200 UART compatibility commands
+- ESP basic commands and live UART baud changes, including non-standard Next
+  rates such as 230769 baud
 - virtual reset messages reporting `WIFI CONNECTED` and `WIFI GOT IP`
 - single-connection TCP through `CIPMUX=0`, `CIPSTART`, `CIPSEND`, and
   `CIPCLOSE`
@@ -23,7 +24,11 @@ stages:
 - fixed-length, binary-safe `CIPSEND` payload handling up to 64 KiB
 - single-connection transparent TCP through `CIPMODE=1` and bare `CIPSEND`
 - raw bidirectional UART/TCP forwarding with `+++` escape handling
+- hardware ESP reset detection through CTS when used with the patched ZXNext
+  core, including socket teardown and a clean emulator restart
 - optional `CIPSTART` TCP keepalive intervals
+- station-mode Wi-Fi compatibility through `CWMODE`, with MiSTer Linux IP and
+  MAC reporting through `CIFSR`
 - `CIPDINFO` and `CIPRECVMODE` initialization compatibility
 - mux-aware `CONNECT`, `+IPD`, and `CLOSED` notifications
 - `CIPSTATUS` reporting for active connections
@@ -57,14 +62,32 @@ guarantee for every MiSTer installation.
 
 ## Build and test
 
-Requirements: Go 1.22 or later.
+Requirements: Go 1.22 or later. Building ZIP releases additionally requires
+`zip`, `sha256sum`, and GNU `touch`.
+
+FPGA changes use a separate Quartus toolchain and ZXNext core checkout. See
+[Building and deploying the ZX Spectrum Next MiSTer core](ZXNEXT_MISTER_CORE_BUILD.md).
 
 ```sh
 make test
+make version
 make build
 make build-mister
 make package-mister
+make release-zip
 ```
+
+`make version` shows the value baked into builds made from the current checkout:
+
+- a clean commit with an exact tag uses that tag
+- a clean untagged commit uses `git rev-parse --short HEAD`
+- any staged, unstaged, or untracked change uses the short hash followed by
+  `[dirty]`
+
+For example, `v0.1.0`, `a1b2c3d`, and `a1b2c3d[dirty]` are possible program
+versions. The same value is printed by `nextnet -version`, logged at startup,
+and returned in the `AT+GMR` response. Builds made directly with `go build`
+instead of the project build targets retain the `dev` fallback.
 
 The MiSTer build is a stripped, CGO-free Linux ARMv7 executable at:
 
@@ -79,9 +102,54 @@ dist/nextnet-mister-armv7.tar.gz
 dist/nextnet-mister-armv7.tar.gz.sha256
 ```
 
+For a distributable ZIP containing the binary, installer, uninstaller, README,
+and BASIC reset example, run:
+
+```sh
+./scripts/build-release.sh
+```
+
+The ZIP filename uses the detected version. Characters unsuitable for an
+archive name are replaced with `-`, so a dirty program version such as
+`a1b2c3d[dirty]` produces:
+
+```text
+dist/nextnet-mister-armv7-a1b2c3d-dirty.zip
+dist/nextnet-mister-armv7-a1b2c3d-dirty.zip.sha256
+```
+
+## Create a tagged release
+
+After committing all release changes, supply the new version to:
+
+```sh
+./scripts/release.sh v1.2.3
+```
+
+The script requires a named branch and a completely clean working tree,
+including no staged or untracked files. It rejects an invalid or existing tag,
+runs the test suite, creates an annotated tag on the current commit, and builds
+fresh host, ARMv7 tar, and versioned ZIP outputs under `dist/`. It verifies that
+the tag is the version detected by the build, then pushes only that tag.
+
+The configured remote for the current branch is used when available. Otherwise
+the script uses `origin`, or the sole configured remote. The tag is pushed only
+after all builds succeed. If building or pushing fails, the newly-created local
+tag is removed so the release can be corrected and retried.
+
 ## Install on MiSTer
 
-Copy the package to MiSTer, extract it, and run the installer as root:
+Copy either package to a permanent location on the MiSTer SD card, extract it,
+and run the installer as root. For the ZIP release:
+
+```sh
+sha256sum -c nextnet-mister-armv7-v0.1.0.zip.sha256
+unzip nextnet-mister-armv7-v0.1.0.zip
+cd nextnet-mister
+./install.sh
+```
+
+For the tar archive:
 
 ```sh
 sha256sum -c nextnet-mister-armv7.tar.gz.sha256
@@ -90,38 +158,49 @@ cd nextnet-mister
 ./install.sh
 ```
 
-The installer can safely be run again to update the binary. It:
+The installer can safely be run again after replacing or updating the bundle.
+It:
 
-- installs nextnet under `/media/fat/linux/nextnet`
+- makes the existing `nextnet` binary executable and runs it from the directory
+  where the package was extracted; it does not copy the program elsewhere
 - preserves unrelated contents of `/media/fat/linux/user-startup.sh`
-- adds exactly one marked automatic-startup block
+- adds exactly one marked automatic-startup block using the binary's absolute
+  path
 - saves the original startup file as `user-startup.sh.nextnet.bak` the first
   time it edits an existing file
 - starts the daemon immediately unless it is already running
 
-At subsequent MiSTer boots, `user-startup.sh` launches:
+For example, if the archive was extracted directly under `/media/fat`, then at
+subsequent MiSTer boots `user-startup.sh` launches:
 
 ```sh
-/media/fat/linux/nextnet/nextnet -device /dev/ttyS1 -baud 115200
+/media/fat/nextnet-mister/nextnet -device /dev/ttyS1 -baud 115200
 ```
+
+Do not move or delete the extracted directory after installation. If it is
+moved, run `install.sh` again from the new location to update the startup path.
 
 Output is redirected to the volatile `/tmp/nextnet.log`, avoiding continuous
 writes to the SD card. The daemon holds `/tmp/nextnet.lock`, so manual or
 duplicate startup attempts cannot own the UART simultaneously.
 
-To remove nextnet and only its marked startup block, run:
+To stop nextnet and remove only its marked startup block, run the uninstaller
+from that same extracted directory:
 
 ```sh
-/media/fat/linux/nextnet/uninstall.sh
+./uninstall.sh
 ```
+
+The uninstaller leaves the package files in place so they can be installed
+again or deleted manually.
 
 ## Run manually on MiSTer
 
 For development, copy the ARMv7 executable to MiSTer, make it executable, and
-run it as root:
+run it as root from wherever it was copied:
 
 ```sh
-/media/fat/linux/nextnet/nextnet -device /dev/ttyS1 -baud 115200
+/media/fat/nextnet -device /dev/ttyS1 -baud 115200
 ```
 
 The `-device` option can be omitted to auto-select `/dev/ttyS1` when it exists.
@@ -164,6 +243,8 @@ time=... level=INFO msg="socket received" id=0 bytes=512
 time=... level=INFO msg="transparent mode entered" id=0
 time=... level=INFO msg="transparent socket sent" id=0 bytes=24
 time=... level=INFO msg="transparent mode exited" cause="escape sequence"
+time=... level=INFO msg="ESP hardware reset detected" device=/dev/ttyS1 signal=CTS
+time=... level=INFO msg="ESP emulator reset" device=/dev/ttyS1
 ```
 
 Available options:
@@ -195,9 +276,17 @@ AT+RST
 AT+UART_CUR?
 AT+UART_DEF?
 AT+UART?
-AT+UART_CUR=115200,8,1,0,0
+AT+UART_CUR=baud,8,1,0,0
 AT+UART_DEF=115200,8,1,0,0
-AT+UART=115200,8,1,0,0
+AT+UART=baud,8,1,0,0
+
+AT+CWMODE?
+AT+CWMODE_CUR?
+AT+CWMODE_DEF?
+AT+CWMODE=1
+AT+CWMODE_CUR=1
+AT+CWMODE_DEF=1
+AT+CIFSR
 
 AT+CIPMUX?
 AT+CIPMUX=0
@@ -240,11 +329,41 @@ implemented; `CIPMODE=1` uses transparent raw reception, and normal mode keeps
 using unsolicited `+IPD` frames. `CIPDINFO=1` adds the remote address and port
 to normal-mode `+IPD` headers.
 
-UART setters are accepted only when they match the daemon's configured fixed
-baud and raw 8N1/no-flow-control settings. This avoids claiming a baud change
-that Linux termios has not actually performed.
+`AT+UART_CUR` and legacy `AT+UART` accept rates from 80 through 5000000 baud
+with raw 8N1/no-flow-control framing. nextnet sends and drains `OK` at the old
+rate before changing Linux termios, and supports non-standard values such as
+230769 through `termios2`. `AT+RST` restores the startup baud. Persistent
+`AT+UART_DEF` changes are not implemented; its setter is accepted only for the
+configured startup value.
+
+`CWMODE`, `CWMODE_CUR`, and `CWMODE_DEF` expose station mode (`1`), because
+the MiSTer host supplies the network connection and nextnet does not emulate a
+Wi-Fi access point. `AT+CIFSR` reports an active non-loopback IPv4 address and
+MAC address from MiSTer Linux. If no suitable interface can be discovered, it
+returns `0.0.0.0` and `00:00:00:00:00:00` while keeping the AT session alive.
 
 ## MiSTer acceptance tests
+
+### ESP reset test
+
+[`examples/esp-reset.bas`](examples/esp-reset.bas) is a short NextBASIC source
+listing that pulses NextReg `$02` bit 7 for ten video frames:
+
+```basic
+10 REM NEXTNET ESP RESET TEST
+20 CLS
+30 PRINT "RESETTING ESP..."
+40 REG 2,128
+50 PAUSE 10
+60 REG 2,0
+70 PRINT "ESP RESET RELEASED"
+```
+
+Enter the listing in NextBASIC and run it while nextnet is active. With the
+patched core, `/tmp/nextnet.log` should contain `ESP hardware reset detected`
+followed by `ESP emulator reset`. Always execute `REG 2,0` to release the reset
+line; if the program is interrupted between lines 40 and 60, enter that command
+manually at the BASIC prompt.
 
 With the daemon running and ZXNext active, send:
 
@@ -269,4 +388,7 @@ acceptance run should open two IDs, send data independently with
 `AT+CIPSEND=id,length`, and verify incoming frames use
 `+IPD,id,length:<payload>`. Leaving ZXNext must close both sockets and return
 the daemon to its idle state. The observed NXTEL transparent-mode command
-sequence is covered by host tests and remains to be verified on MiSTer.
+sequence is covered by host tests. With the patched core installed, NXTEL's
+ESP reset should log `ESP hardware reset detected`, close its transparent
+socket, and restart the emulator in AT command mode. That complete reset
+sequence remains to be verified on MiSTer.

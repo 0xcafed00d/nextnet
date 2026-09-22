@@ -7,7 +7,6 @@ BEGIN_MARKER="# BEGIN nextnet"
 END_MARKER="# END nextnet"
 MEDIA_ROOT=${NEXTNET_MEDIA_ROOT:-/media/fat}
 LINUX_DIR="$MEDIA_ROOT/linux"
-INSTALL_DIR="$LINUX_DIR/nextnet"
 STARTUP_FILE="$LINUX_DIR/user-startup.sh"
 LOCK_FILE=${NEXTNET_LOCK_FILE:-/tmp/nextnet.lock}
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
@@ -36,6 +35,18 @@ find_binary() {
 		return
 	fi
 	fail "cannot find the ARMv7 binary; pass its path as the only argument"
+}
+
+absolute_path() {
+	path=$1
+	directory=$(CDPATH= cd "$(dirname "$path")" && pwd)
+	printf '%s/%s\n' "$directory" "$(basename "$path")"
+}
+
+shell_quote() {
+	value=$1
+	escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
+	printf "'%s'" "$escaped"
 }
 
 marker_count() {
@@ -79,12 +90,14 @@ remove_startup_blocks() {
 
 write_startup_block() {
 	file=$1
+	binary=$2
+	quoted_binary=$(shell_quote "$binary")
 	if [ -s "$file" ]; then
 		printf '\n' >> "$file"
 	fi
 	printf '%s\n' "$BEGIN_MARKER" >> "$file"
-	printf 'if [ -x "%s/nextnet" ]; then\n' "$INSTALL_DIR" >> "$file"
-	printf '    "%s/nextnet" -device /dev/ttyS1 -baud 115200 </dev/null >>/tmp/nextnet.log 2>&1 &\n' "$INSTALL_DIR" >> "$file"
+	printf 'if [ -x %s ]; then\n' "$quoted_binary" >> "$file"
+	printf '    %s -device /dev/ttyS1 -baud 115200 </dev/null >>/tmp/nextnet.log 2>&1 &\n' "$quoted_binary" >> "$file"
 	printf 'fi\n' >> "$file"
 	printf '%s\n' "$END_MARKER" >> "$file"
 }
@@ -100,6 +113,7 @@ fi
 
 BINARY=$(find_binary "$@")
 [ -f "$BINARY" ] || fail "binary does not exist: $BINARY"
+BINARY=$(absolute_path "$BINARY")
 [ ! -L "$STARTUP_FILE" ] || fail "refusing to replace symbolic link: $STARTUP_FILE"
 [ ! -e "$STARTUP_FILE" ] || [ -f "$STARTUP_FILE" ] || fail "not a regular file: $STARTUP_FILE"
 STARTUP_BACKUP="$STARTUP_FILE.nextnet.bak"
@@ -113,30 +127,14 @@ if [ -f "$STARTUP_FILE" ]; then
 	[ "$begin_count" -eq "$end_count" ] || fail "unmatched nextnet markers in $STARTUP_FILE"
 fi
 
-mkdir -p "$INSTALL_DIR"
-STAGE_DIR=$(mktemp -d "$INSTALL_DIR/.install.XXXXXX")
-TEMP_BINARY="$STAGE_DIR/nextnet"
-TEMP_INSTALLER="$STAGE_DIR/install.sh"
-TEMP_UNINSTALLER="$STAGE_DIR/uninstall.sh"
 TEMP_STARTUP=
 cleanup() {
-	rm -f "$TEMP_BINARY" "$TEMP_INSTALLER" "$TEMP_UNINSTALLER" "$TEMP_STARTUP"
-	rmdir "$STAGE_DIR" 2>/dev/null || true
+	rm -f "$TEMP_STARTUP"
 }
 trap cleanup EXIT HUP INT TERM
 TEMP_STARTUP=$(mktemp "$LINUX_DIR/.user-startup.sh.nextnet.XXXXXX")
 
-cp "$BINARY" "$TEMP_BINARY"
-chmod 755 "$TEMP_BINARY"
-
-if [ -f "$SCRIPT_DIR/install.sh" ]; then
-	cp "$SCRIPT_DIR/install.sh" "$TEMP_INSTALLER"
-	chmod 755 "$TEMP_INSTALLER"
-fi
-if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
-	cp "$SCRIPT_DIR/uninstall.sh" "$TEMP_UNINSTALLER"
-	chmod 755 "$TEMP_UNINSTALLER"
-fi
+chmod +x "$BINARY"
 
 if [ -f "$STARTUP_FILE" ]; then
 	if [ ! -e "$STARTUP_BACKUP" ]; then
@@ -147,16 +145,9 @@ else
 	printf '#!/bin/sh\n' > "$TEMP_STARTUP"
 fi
 
-write_startup_block "$TEMP_STARTUP"
+write_startup_block "$TEMP_STARTUP" "$BINARY"
 chmod 755 "$TEMP_STARTUP"
 
-mv -f "$TEMP_BINARY" "$INSTALL_DIR/nextnet"
-if [ -f "$TEMP_INSTALLER" ]; then
-	mv -f "$TEMP_INSTALLER" "$INSTALL_DIR/install.sh"
-fi
-if [ -f "$TEMP_UNINSTALLER" ]; then
-	mv -f "$TEMP_UNINSTALLER" "$INSTALL_DIR/uninstall.sh"
-fi
 mv -f "$TEMP_STARTUP" "$STARTUP_FILE"
 
 already_running=false
@@ -175,7 +166,7 @@ if [ -r "$LOCK_FILE" ]; then
 	esac
 fi
 
-printf 'Installed %s\n' "$INSTALL_DIR/nextnet"
+printf 'Configured %s in place\n' "$BINARY"
 printf 'Enabled automatic startup in %s\n' "$STARTUP_FILE"
 
 if [ "${NEXTNET_NO_START:-0}" = "1" ]; then
@@ -183,7 +174,7 @@ if [ "${NEXTNET_NO_START:-0}" = "1" ]; then
 elif [ "$already_running" = "true" ]; then
 	printf 'nextnet is already running; the new binary will be used after restart or reboot\n'
 else
-	"$INSTALL_DIR/nextnet" -device /dev/ttyS1 -baud 115200 </dev/null >>/tmp/nextnet.log 2>&1 &
+	"$BINARY" -device /dev/ttyS1 -baud 115200 </dev/null >>/tmp/nextnet.log 2>&1 &
 	started_pid=$!
 	sleep 1
 	if kill -0 "$started_pid" 2>/dev/null; then

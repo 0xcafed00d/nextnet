@@ -2,6 +2,7 @@ package esp
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -54,7 +55,94 @@ func TestUARTCompatibilityCommands(t *testing.T) {
 	}
 	result := emulator.executeCommand(context.Background(), "AT+UART_CUR=9600,8,1,0,0")
 	if !result.known || result.rejected == "" {
-		t.Fatalf("mismatched fixed baud was not rejected: %+v", result)
+		t.Fatalf("baud change without a capable transport was not rejected: %+v", result)
+	}
+
+	dynamic := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
+		Baud:    115200,
+		SetBaud: func(int) error { return nil },
+	})
+	result = dynamic.executeCommand(context.Background(), "AT+UART_CUR=230769,8,1,0,0")
+	if !result.known || result.rejected != "" || result.setBaud != 230769 {
+		t.Fatalf("non-standard baud change was not accepted: %+v", result)
+	}
+	for _, command := range []string{
+		"AT+UART_CUR=230769,7,1,0,0",
+		"AT+UART_CUR=5000001,8,1,0,0",
+		"AT+UART_DEF=230769,8,1,0,0",
+	} {
+		result = dynamic.executeCommand(context.Background(), command)
+		if !result.known || result.rejected == "" {
+			t.Fatalf("unsupported UART configuration %q was not rejected: %+v", command, result)
+		}
+	}
+}
+
+func TestWiFiStationCompatibilityCommands(t *testing.T) {
+	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
+		StationInfo: func() (StationInfo, error) {
+			return StationInfo{
+				IPAddress:  "192.0.2.10",
+				MACAddress: "02:00:00:00:00:01",
+			}, nil
+		},
+	})
+
+	for _, command := range []string{
+		"AT+CWMODE=1",
+		"AT+CWMODE_CUR=1",
+		"AT+CWMODE_DEF=1",
+	} {
+		result := emulator.executeCommand(context.Background(), command)
+		if !result.known || result.rejected != "" || string(result.response) != string(responseOK) {
+			t.Errorf("%s result = %+v", command, result)
+		}
+	}
+
+	for _, tc := range []struct {
+		command string
+		want    string
+	}{
+		{command: "AT+CWMODE?", want: "\r\n+CWMODE:1\r\n\r\nOK\r\n"},
+		{command: "AT+CWMODE_CUR?", want: "\r\n+CWMODE_CUR:1\r\n\r\nOK\r\n"},
+		{command: "AT+CWMODE_DEF?", want: "\r\n+CWMODE_DEF:1\r\n\r\nOK\r\n"},
+	} {
+		result := emulator.executeCommand(context.Background(), tc.command)
+		if !result.known || result.rejected != "" || string(result.response) != tc.want {
+			t.Errorf("%s response = %q, rejected %q", tc.command, result.response, result.rejected)
+		}
+	}
+
+	for _, command := range []string{
+		"AT+CWMODE=0",
+		"AT+CWMODE=2",
+		"AT+CWMODE=3",
+		"AT+CWMODE=station",
+	} {
+		result := emulator.executeCommand(context.Background(), command)
+		if !result.known || result.rejected == "" || string(result.response) != string(responseError) {
+			t.Errorf("unsupported Wi-Fi mode %s was not rejected: %+v", command, result)
+		}
+	}
+
+	result := emulator.executeCommand(context.Background(), "AT+CIFSR")
+	want := "\r\n+CIFSR:STAIP,\"192.0.2.10\"\r\n+CIFSR:STAMAC,\"02:00:00:00:00:01\"\r\n\r\nOK\r\n"
+	if !result.known || result.rejected != "" || string(result.response) != want {
+		t.Fatalf("AT+CIFSR response = %q, rejected %q", result.response, result.rejected)
+	}
+}
+
+func TestCIFSRFallsBackWhenInterfaceDiscoveryFails(t *testing.T) {
+	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
+		StationInfo: func() (StationInfo, error) {
+			return StationInfo{}, errors.New("no interface")
+		},
+	})
+
+	result := emulator.executeCommand(context.Background(), "AT+CIFSR")
+	want := "\r\n+CIFSR:STAIP,\"0.0.0.0\"\r\n+CIFSR:STAMAC,\"00:00:00:00:00:00\"\r\n\r\nOK\r\n"
+	if !result.known || result.rejected != "" || string(result.response) != want {
+		t.Fatalf("AT+CIFSR fallback = %q, rejected %q", result.response, result.rejected)
 	}
 }
 

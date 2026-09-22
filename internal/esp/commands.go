@@ -27,6 +27,7 @@ type commandResult struct {
 	rejected            string
 	setEcho             *bool
 	reset               bool
+	setBaud             int
 	enterTransparent    bool
 	payloadLength       int
 	payloadConnectionID int
@@ -73,7 +74,12 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 		}
 		result := accepted(responseReset, "OK + WIFI CONNECTED + WIFI GOT IP + ready")
 		result.reset = true
+		if e.currentBaud != e.defaultBaud {
+			result.setBaud = e.defaultBaud
+		}
 		return result
+	case "AT+CIFSR":
+		return e.executeCIFSR()
 	case "AT+CIPMUX?":
 		value := 0
 		if e.mux {
@@ -127,6 +133,9 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 	if result, matched := e.executeUARTCommand(command, upper); matched {
 		return result
 	}
+	if result, matched := e.executeCWMODECommand(command, upper); matched {
+		return result
+	}
 	if strings.HasPrefix(upper, "AT+CIPSTART=") {
 		return e.executeCIPStart(ctx, command)
 	}
@@ -144,15 +153,52 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 	return commandResult{response: responseError, responseLog: "ERROR"}
 }
 
-func (e *Emulator) executeUARTCommand(command, upper string) (commandResult, bool) {
+func (e *Emulator) executeCWMODECommand(command, upper string) (commandResult, bool) {
 	queries := map[string]string{
-		"AT+UART_CUR?": "+UART_CUR",
-		"AT+UART_DEF?": "+UART_DEF",
-		"AT+UART?":     "+UART",
+		"AT+CWMODE?":     "+CWMODE",
+		"AT+CWMODE_CUR?": "+CWMODE_CUR",
+		"AT+CWMODE_DEF?": "+CWMODE_DEF",
 	}
 	if label, ok := queries[upper]; ok {
-		response := fmt.Sprintf("\r\n%s:%d,8,1,0,0\r\n\r\nOK\r\n", label, e.config.Baud)
-		return accepted([]byte(response), label+" + OK"), true
+		response := fmt.Sprintf("\r\n%s:1\r\n\r\nOK\r\n", label)
+		return accepted([]byte(response), label+":1 + OK"), true
+	}
+
+	for _, prefix := range []string{"AT+CWMODE=", "AT+CWMODE_CUR=", "AT+CWMODE_DEF="} {
+		if !strings.HasPrefix(upper, prefix) {
+			continue
+		}
+		mode, err := strconv.Atoi(strings.TrimSpace(command[len(prefix):]))
+		if err != nil || mode != 1 {
+			return rejected(responseError, "ERROR", "only station mode 1 is supported"), true
+		}
+		return accepted(responseOK, "OK"), true
+	}
+	return commandResult{}, false
+}
+
+func (e *Emulator) executeCIFSR() commandResult {
+	info, err := e.config.StationInfo()
+	if err != nil {
+		e.logger.Warn("station interface discovery failed", "error", err)
+		info = StationInfo{IPAddress: "0.0.0.0", MACAddress: "00:00:00:00:00:00"}
+	}
+	response := fmt.Sprintf("\r\n+CIFSR:STAIP,%q\r\n+CIFSR:STAMAC,%q\r\n\r\nOK\r\n", info.IPAddress, info.MACAddress)
+	return accepted([]byte(response), "station IP and MAC + OK")
+}
+
+func (e *Emulator) executeUARTCommand(command, upper string) (commandResult, bool) {
+	queries := map[string]struct {
+		label string
+		baud  int
+	}{
+		"AT+UART_CUR?": {label: "+UART_CUR", baud: e.currentBaud},
+		"AT+UART_DEF?": {label: "+UART_DEF", baud: e.defaultBaud},
+		"AT+UART?":     {label: "+UART", baud: e.currentBaud},
+	}
+	if query, ok := queries[upper]; ok {
+		response := fmt.Sprintf("\r\n%s:%d,8,1,0,0\r\n\r\nOK\r\n", query.label, query.baud)
+		return accepted([]byte(response), query.label+" + OK"), true
 	}
 
 	for _, prefix := range []string{"AT+UART_CUR=", "AT+UART_DEF=", "AT+UART="} {
@@ -163,12 +209,30 @@ func (e *Emulator) executeUARTCommand(command, upper string) (commandResult, boo
 		if err != nil {
 			return rejected(responseError, "ERROR", err.Error()), true
 		}
-		want := uartSettings{baud: e.config.Baud, dataBits: 8, stopBits: 1, parity: 0, flowControl: 0}
-		if settings != want {
+		if settings.dataBits != 8 || settings.stopBits != 1 || settings.parity != 0 || settings.flowControl != 0 {
 			return rejected(responseError, "ERROR",
-				fmt.Sprintf("fixed UART configuration is %d,8,1,0,0", e.config.Baud)), true
+				"only 8 data bits, 1 stop bit, no parity, and no flow control are supported"), true
 		}
-		return accepted(responseOK, "OK"), true
+		if settings.baud < 80 || settings.baud > 5_000_000 {
+			return rejected(responseError, "ERROR", "UART baud must be between 80 and 5000000"), true
+		}
+
+		if prefix == "AT+UART_DEF=" {
+			if settings.baud != e.defaultBaud {
+				return rejected(responseError, "ERROR",
+					fmt.Sprintf("persistent UART baud changes are not implemented; default is %d", e.defaultBaud)), true
+			}
+			return accepted(responseOK, "OK"), true
+		}
+		if settings.baud == e.currentBaud {
+			return accepted(responseOK, "OK"), true
+		}
+		if e.config.SetBaud == nil {
+			return rejected(responseError, "ERROR", "serial transport does not support baud changes"), true
+		}
+		result := accepted(responseOK, "OK")
+		result.setBaud = settings.baud
+		return result, true
 	}
 	return commandResult{}, false
 }

@@ -1,6 +1,7 @@
 package serial
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,21 @@ type Transport interface {
 	io.Reader
 	io.Writer
 	io.Closer
+}
+
+// BaudSetter changes a live transport's baud rate after queued output has
+// drained. Linux implements this with termios2 so non-standard rates such as
+// the Spectrum Next's 230769 baud are supported.
+type BaudSetter interface {
+	SetBaud(int) error
+}
+
+// ResetWatcher is implemented by transports that can observe the ZXNext
+// peripheral-reset signal. The patched MiSTer core routes that signal through
+// UART_RTS to the HPS UART's CTS input. A nil result means a reset edge was
+// detected; context cancellation stops the monitor.
+type ResetWatcher interface {
+	WaitForReset(context.Context) error
 }
 
 // Resolve returns an explicit device unchanged or selects the verified MiSTer

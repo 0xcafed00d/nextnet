@@ -30,9 +30,17 @@ type Transport interface {
 	io.Closer
 }
 
+type outputFrame struct {
+	data       []byte
+	afterWrite func() error
+	done       chan<- error
+}
+
 type Config struct {
 	Version      string
 	Baud         int
+	SetBaud      func(int) error
+	StationInfo  func() (StationInfo, error)
 	Dialer       sockets.Dialer
 	DialTimeout  time.Duration
 	WriteTimeout time.Duration
@@ -42,6 +50,8 @@ type Config struct {
 type Emulator struct {
 	logger                *slog.Logger
 	config                Config
+	defaultBaud           int
+	currentBaud           int
 	echo                  bool
 	mux                   bool
 	cipdInfo              bool
@@ -74,6 +84,9 @@ func New(logger *slog.Logger, config Config) *Emulator {
 	if config.MaxSendSize <= 0 {
 		config.MaxSendSize = defaultMaxSendSize
 	}
+	if config.StationInfo == nil {
+		config.StationInfo = discoverStationInfo
+	}
 	if config.Dialer == nil {
 		config.Dialer = &net.Dialer{
 			Timeout:   config.DialTimeout,
@@ -81,9 +94,11 @@ func New(logger *slog.Logger, config Config) *Emulator {
 		}
 	}
 	return &Emulator{
-		logger: logger,
-		config: config,
-		echo:   true,
+		logger:      logger,
+		config:      config,
+		defaultBaud: config.Baud,
+		currentBaud: config.Baud,
+		echo:        true,
 	}
 }
 
@@ -95,7 +110,7 @@ func (e *Emulator) Serve(ctx context.Context, transport Transport) error {
 	defer cancel()
 	defer transport.Close()
 
-	output := make(chan []byte, outputFrames)
+	output := make(chan outputFrame, outputFrames)
 	e.socketManager = sockets.New(e.config.Dialer, sockets.Events{
 		Data: func(link sockets.Link, payload []byte) {
 			e.emitIPD(serveCtx, output, link, payload)
@@ -194,7 +209,7 @@ readLoop:
 	return readErr
 }
 
-func (e *Emulator) processEvent(ctx context.Context, output chan<- []byte, event parseEvent) error {
+func (e *Emulator) processEvent(ctx context.Context, output chan<- outputFrame, event parseEvent) error {
 	e.outputMu.Lock()
 	defer e.outputMu.Unlock()
 
@@ -236,7 +251,18 @@ func (e *Emulator) processEvent(ctx context.Context, output chan<- []byte, event
 	default:
 		e.logger.Info("AT supported", "command", safeCommand)
 	}
-	if err := enqueue(ctx, output, result.response); err != nil {
+	if result.setBaud > 0 {
+		oldBaud := e.currentBaud
+		newBaud := result.setBaud
+		if err := enqueueAfterWrite(ctx, output, result.response, func() error {
+			return e.config.SetBaud(newBaud)
+		}); err != nil {
+			e.logger.Error("UART baud change failed", "from", oldBaud, "to", newBaud, "error", err)
+			return err
+		}
+		e.currentBaud = newBaud
+		e.logger.Info("UART baud changed", "from", oldBaud, "to", newBaud)
+	} else if err := enqueue(ctx, output, result.response); err != nil {
 		return err
 	}
 	e.logger.Info("AT -> " + result.responseLog)
@@ -327,7 +353,7 @@ func (e *Emulator) sendTransparentPayload(payload []byte) {
 	e.logger.Info("transparent socket sent", "id", 0, "bytes", len(payload))
 }
 
-func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- []byte, value byte) error {
+func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- outputFrame, value byte) error {
 	e.payload = append(e.payload, value)
 	if len(e.payload) < e.payloadExpected {
 		return nil
@@ -358,7 +384,7 @@ func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- []byte,
 	return nil
 }
 
-func (e *Emulator) emitIPD(ctx context.Context, output chan<- []byte, link sockets.Link, payload []byte) {
+func (e *Emulator) emitIPD(ctx context.Context, output chan<- outputFrame, link sockets.Link, payload []byte) {
 	e.outputMu.Lock()
 	frame := append([]byte(nil), payload...)
 	// CIPMODE=1 selects passthrough receiving mode immediately. Bare CIPSEND
@@ -389,7 +415,7 @@ func (e *Emulator) emitIPD(ctx context.Context, output chan<- []byte, link socke
 	}
 }
 
-func (e *Emulator) emitClosed(ctx context.Context, output chan<- []byte, link sockets.Link) {
+func (e *Emulator) emitClosed(ctx context.Context, output chan<- outputFrame, link sockets.Link) {
 	e.outputMu.Lock()
 	wasTransparent := e.transparentActive.Swap(false)
 	frame := []byte("\r\nCLOSED\r\n")
@@ -404,6 +430,7 @@ func (e *Emulator) emitClosed(ctx context.Context, output chan<- []byte, link so
 }
 
 func (e *Emulator) resetState() {
+	e.currentBaud = e.defaultBaud
 	e.echo = true
 	e.mux = false
 	e.cipdInfo = false
@@ -418,17 +445,37 @@ func (e *Emulator) resetState() {
 	e.payload = nil
 }
 
-func enqueue(ctx context.Context, output chan<- []byte, frame []byte) error {
-	copyOfFrame := append([]byte(nil), frame...)
+func enqueue(ctx context.Context, output chan<- outputFrame, data []byte) error {
+	frame := outputFrame{data: append([]byte(nil), data...)}
 	select {
-	case output <- copyOfFrame:
+	case output <- frame:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func writeLoop(ctx context.Context, transport io.Writer, output <-chan []byte) error {
+func enqueueAfterWrite(ctx context.Context, output chan<- outputFrame, data []byte, afterWrite func() error) error {
+	done := make(chan error, 1)
+	frame := outputFrame{
+		data:       append([]byte(nil), data...),
+		afterWrite: afterWrite,
+		done:       done,
+	}
+	select {
+	case output <- frame:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func writeLoop(ctx context.Context, transport io.Writer, output <-chan outputFrame) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -437,10 +484,24 @@ func writeLoop(ctx context.Context, transport io.Writer, output <-chan []byte) e
 			if !ok {
 				return nil
 			}
-			if err := writeAll(transport, frame); err != nil {
+			if err := writeAll(transport, frame.data); err != nil {
+				completeFrame(frame, err)
 				return err
 			}
+			if frame.afterWrite != nil {
+				err := frame.afterWrite()
+				completeFrame(frame, err)
+				if err != nil {
+					return fmt.Errorf("post-write action: %w", err)
+				}
+			}
 		}
+	}
+}
+
+func completeFrame(frame outputFrame, err error) {
+	if frame.done != nil {
+		frame.done <- err
 	}
 }
 

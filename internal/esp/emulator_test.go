@@ -44,6 +44,57 @@ func TestEmulatorBasicCommandsAndEcho(t *testing.T) {
 	}
 }
 
+func TestEmulatorChangesBaudAfterAcknowledgement(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	emulatorSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+
+	baudChanges := make(chan int, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- New(logger, Config{
+			Version: "test",
+			Baud:    115200,
+			SetBaud: func(baud int) error {
+				baudChanges <- baud
+				return nil
+			},
+		}).Serve(ctx, emulatorSide)
+	}()
+
+	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+UART_CUR=230769,8,1,0,0\r\n", "\r\nOK\r\n")
+	if got := <-baudChanges; got != 230769 {
+		t.Fatalf("baud changed to %d, want 230769", got)
+	}
+	testExchange(t, clientSide, "AT+UART_CUR?\r\n", "\r\n+UART_CUR:230769,8,1,0,0\r\n\r\nOK\r\n")
+
+	testExchange(t, clientSide, "AT+RST\r\n", "\r\nOK\r\nWIFI CONNECTED\r\nWIFI GOT IP\r\n\r\nready\r\n")
+	if got := <-baudChanges; got != 115200 {
+		t.Fatalf("reset restored baud %d, want 115200", got)
+	}
+	testExchange(t, clientSide, "AT+UART_CUR?\r\n", "AT+UART_CUR?\r\n\r\n+UART_CUR:115200,8,1,0,0\r\n\r\nOK\r\n")
+
+	cancel()
+	_ = clientSide.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop after baud test")
+	}
+
+	for _, fragment := range []string{"UART baud changed", "from=115200 to=230769", "from=230769 to=115200"} {
+		if !strings.Contains(logs.String(), fragment) {
+			t.Fatalf("baud log is missing %q: %s", fragment, logs.String())
+		}
+	}
+}
+
 func TestEmulatorLogsCommandsAndRedactsCredentials(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
@@ -52,7 +103,7 @@ func TestEmulatorLogsCommandsAndRedactsCredentials(t *testing.T) {
 	events := newLineParser(maximumATLine).feed([]byte(`AT+CWJAP="network","secret"` + "\r\n"))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	output := make(chan []byte, 4)
+	output := make(chan outputFrame, 4)
 	if err := emulator.processEvent(ctx, output, events[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -72,15 +123,15 @@ func TestEmulatorLogsCommandsAndRedactsCredentials(t *testing.T) {
 func TestAsyncFramesUseConnectionFramingMode(t *testing.T) {
 	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
 	emulator.mux = false
-	output := make(chan []byte, 2)
+	output := make(chan outputFrame, 2)
 	link := sockets.Link{ID: 0, Multiplexed: true}
 
 	emulator.emitIPD(context.Background(), output, link, []byte("DATA"))
 	emulator.emitClosed(context.Background(), output, link)
-	if got := string(<-output); got != "+IPD,0,4:DATA" {
+	if got := string((<-output).data); got != "+IPD,0,4:DATA" {
 		t.Fatalf("delayed mux IPD = %q", got)
 	}
-	if got := string(<-output); got != "\r\n0,CLOSED\r\n" {
+	if got := string((<-output).data); got != "\r\n0,CLOSED\r\n" {
 		t.Fatalf("delayed mux close = %q", got)
 	}
 }
@@ -88,11 +139,11 @@ func TestAsyncFramesUseConnectionFramingMode(t *testing.T) {
 func TestCIPDInfoAddsRemoteEndpointToIPD(t *testing.T) {
 	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
 	emulator.cipdInfo = true
-	output := make(chan []byte, 1)
+	output := make(chan outputFrame, 1)
 	link := sockets.Link{ID: 3, Multiplexed: true, RemoteHost: "192.0.2.4", RemotePort: 8080}
 
 	emulator.emitIPD(context.Background(), output, link, []byte("DATA"))
-	if got := string(<-output); got != "+IPD,3,4,192.0.2.4,8080:DATA" {
+	if got := string((<-output).data); got != "+IPD,3,4,192.0.2.4,8080:DATA" {
 		t.Fatalf("CIPDINFO frame = %q", got)
 	}
 }
@@ -100,13 +151,13 @@ func TestCIPDInfoAddsRemoteEndpointToIPD(t *testing.T) {
 func TestRemoteCloseLeavesTransparentMode(t *testing.T) {
 	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
 	emulator.transparentActive.Store(true)
-	output := make(chan []byte, 1)
+	output := make(chan outputFrame, 1)
 
 	emulator.emitClosed(context.Background(), output, sockets.Link{ID: 0})
 	if emulator.transparentActive.Load() {
 		t.Fatal("transparent mode remained active after remote close")
 	}
-	if got := string(<-output); got != "\r\nCLOSED\r\n" {
+	if got := string((<-output).data); got != "\r\nCLOSED\r\n" {
 		t.Fatalf("remote close frame = %q", got)
 	}
 }

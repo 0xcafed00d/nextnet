@@ -35,6 +35,7 @@ type session struct {
 	port   serial.Transport
 	cancel context.CancelFunc
 	done   <-chan error
+	reset  <-chan error
 }
 
 func New(config Config, logger *slog.Logger) *App {
@@ -60,6 +61,7 @@ func (a *App) Run(ctx context.Context) error {
 	var (
 		activeSession *session
 		sessionDone   <-chan error
+		resetDone     <-chan error
 		lastCore      string
 		haveLastCore  bool
 		lastReadOK    = true
@@ -96,6 +98,7 @@ func (a *App) Run(ctx context.Context) error {
 			a.logger.Info("serial closed; bridge idle", "device", activeSession.device)
 			activeSession = nil
 			sessionDone = nil
+			resetDone = nil
 			retryAt = time.Time{}
 		}
 
@@ -107,6 +110,7 @@ func (a *App) Run(ctx context.Context) error {
 			} else {
 				activeSession = started
 				sessionDone = started.done
+				resetDone = started.reset
 				retryAt = time.Time{}
 			}
 		}
@@ -130,7 +134,26 @@ func (a *App) Run(ctx context.Context) error {
 			}
 			activeSession = nil
 			sessionDone = nil
+			resetDone = nil
 			retryAt = time.Now().Add(a.config.RetryInterval)
+		case err := <-resetDone:
+			resetDone = nil
+			if activeSession == nil {
+				continue
+			}
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					a.logger.Warn("ESP hardware reset monitor stopped", "device", activeSession.device, "error", err)
+				}
+				continue
+			}
+
+			a.logger.Info("ESP hardware reset detected", "device", activeSession.device, "signal", "CTS")
+			a.stopSession(activeSession)
+			a.logger.Info("ESP emulator reset", "device", activeSession.device)
+			activeSession = nil
+			sessionDone = nil
+			retryAt = time.Time{}
 		case <-ticker.C:
 		}
 	}
@@ -148,13 +171,27 @@ func (a *App) startSession(parent context.Context) (*session, error) {
 
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan error, 1)
+	var setBaud func(int) error
+	if baudSetter, ok := port.(serial.BaudSetter); ok {
+		setBaud = baudSetter.SetBaud
+	}
 	emulator := esp.New(a.logger, esp.Config{
 		Version: version.String(),
 		Baud:    a.config.Baud,
+		SetBaud: setBaud,
 	})
 	go func() {
 		done <- emulator.Serve(ctx, port)
 	}()
+
+	var resetDone <-chan error
+	if resetWatcher, ok := port.(serial.ResetWatcher); ok {
+		monitorDone := make(chan error, 1)
+		go func() {
+			monitorDone <- resetWatcher.WaitForReset(ctx)
+		}()
+		resetDone = monitorDone
+	}
 
 	a.logger.Info("serial opened",
 		"device", device,
@@ -162,7 +199,10 @@ func (a *App) startSession(parent context.Context) (*session, error) {
 		"format", "8N1",
 	)
 	a.logger.Info("ESP emulator active")
-	return &session{device: device, port: port, cancel: cancel, done: done}, nil
+	if resetDone != nil {
+		a.logger.Info("ESP hardware reset monitor active", "signal", "CTS", "trigger", "deasserted")
+	}
+	return &session{device: device, port: port, cancel: cancel, done: done, reset: resetDone}, nil
 }
 
 func (a *App) stopSession(active *session) {

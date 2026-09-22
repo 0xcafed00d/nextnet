@@ -7,7 +7,6 @@ BEGIN_MARKER="# BEGIN nextnet"
 END_MARKER="# END nextnet"
 MEDIA_ROOT=${NEXTNET_MEDIA_ROOT:-/media/fat}
 LINUX_DIR="$MEDIA_ROOT/linux"
-INSTALL_DIR="$LINUX_DIR/nextnet"
 STARTUP_FILE="$LINUX_DIR/user-startup.sh"
 LOCK_FILE=${NEXTNET_LOCK_FILE:-/tmp/nextnet.lock}
 
@@ -86,8 +85,8 @@ if [ -r "$LOCK_FILE" ]; then
 			if kill -0 "$lock_pid" 2>/dev/null; then
 				running_exe=$(readlink "/proc/$lock_pid/exe" 2>/dev/null || true)
 				case $running_exe in
-					"$INSTALL_DIR/nextnet"|"$INSTALL_DIR/nextnet (deleted)") running_pid=$lock_pid ;;
-					*) printf 'Not stopping PID %s because it is not the installed nextnet binary\n' "$lock_pid" >&2 ;;
+					*/nextnet|*/nextnet\ \(deleted\)) running_pid=$lock_pid ;;
+					*) printf 'Not stopping PID %s because it is not a nextnet binary\n' "$lock_pid" >&2 ;;
 				esac
 			fi
 			;;
@@ -107,9 +106,4 @@ if [ -n "$running_pid" ]; then
 	printf 'Stopped nextnet PID %s\n' "$running_pid"
 fi
 
-rm -f "$INSTALL_DIR/nextnet" "$INSTALL_DIR/install.sh" "$INSTALL_DIR/uninstall.sh"
-if [ -d "$INSTALL_DIR" ]; then
-	rmdir "$INSTALL_DIR" 2>/dev/null || true
-fi
-
-printf 'Removed nextnet from %s\n' "$INSTALL_DIR"
+printf 'Disabled nextnet; program files were left in place\n'

@@ -10,13 +10,13 @@ MEDIA_ROOT="$TEST_DIR/media/fat"
 STARTUP_FILE="$MEDIA_ROOT/linux/user-startup.sh"
 FAKE_BINARY="$TEST_DIR/nextnet"
 LOCK_FILE="$TEST_DIR/nextnet.lock"
-BUNDLE_DIR="$TEST_DIR/bundle"
+BUNDLE_DIR="$TEST_DIR/bundle with spaces"
 
 mkdir -p "$MEDIA_ROOT/linux"
 printf '#!/bin/sh\n# user setting\nexport KEEP_THIS=yes\n' > "$STARTUP_FILE"
 cp "$STARTUP_FILE" "$TEST_DIR/startup.original"
 printf '#!/bin/sh\nexit 0\n' > "$FAKE_BINARY"
-chmod 755 "$FAKE_BINARY"
+chmod 644 "$FAKE_BINARY"
 mkdir -p "$BUNDLE_DIR"
 cp "$FAKE_BINARY" "$BUNDLE_DIR/nextnet"
 cp "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/uninstall.sh" "$BUNDLE_DIR/"
@@ -31,18 +31,19 @@ run_install() {
 run_install >/dev/null
 run_install >/dev/null
 
-[ -x "$MEDIA_ROOT/linux/nextnet/nextnet" ]
-[ -x "$MEDIA_ROOT/linux/nextnet/uninstall.sh" ]
+[ -x "$BUNDLE_DIR/nextnet" ]
+[ ! -e "$MEDIA_ROOT/linux/nextnet" ]
 [ "$(grep -F -x -c '# BEGIN nextnet' "$STARTUP_FILE")" -eq 1 ]
 [ "$(grep -F -x -c '# END nextnet' "$STARTUP_FILE")" -eq 1 ]
 grep -F -q 'export KEEP_THIS=yes' "$STARTUP_FILE"
-grep -F -q '"'"$MEDIA_ROOT"'/linux/nextnet/nextnet" -device /dev/ttyS1 -baud 115200' "$STARTUP_FILE"
+grep -F -q "'$BUNDLE_DIR/nextnet' -device /dev/ttyS1 -baud 115200" "$STARTUP_FILE"
+sh -n "$STARTUP_FILE"
 cmp "$TEST_DIR/startup.original" "$STARTUP_FILE.nextnet.bak"
 
 NEXTNET_MEDIA_ROOT="$MEDIA_ROOT" NEXTNET_LOCK_FILE="$LOCK_FILE" \
-	sh "$MEDIA_ROOT/linux/nextnet/uninstall.sh" >/dev/null
+	sh "$BUNDLE_DIR/uninstall.sh" >/dev/null
 
-[ ! -e "$MEDIA_ROOT/linux/nextnet/nextnet" ]
+[ -x "$BUNDLE_DIR/nextnet" ]
 [ "$(grep -F -x -c '# BEGIN nextnet' "$STARTUP_FILE" || true)" -eq 0 ]
 [ "$(grep -F -x -c '# END nextnet' "$STARTUP_FILE" || true)" -eq 0 ]
 grep -F -q 'export KEEP_THIS=yes' "$STARTUP_FILE"
@@ -59,6 +60,7 @@ if NEXTNET_MEDIA_ROOT="$MALFORMED_ROOT" NEXTNET_LOCK_FILE="$LOCK_FILE" \
 	exit 1
 fi
 cmp "$TEST_DIR/malformed.before" "$MALFORMED_STARTUP"
-[ ! -e "$MALFORMED_ROOT/linux/nextnet/nextnet" ]
+[ "$(stat -c '%a' "$FAKE_BINARY")" = 644 ]
+[ ! -e "$MALFORMED_ROOT/linux/nextnet" ]
 
 printf 'installer tests passed\n'
