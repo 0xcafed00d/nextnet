@@ -22,6 +22,9 @@ const (
 	defaultDialTimeout  = 10 * time.Second
 	defaultWriteTimeout = 10 * time.Second
 	transparentGuard    = 20 * time.Millisecond
+	defaultStationSSID  = "MiSTer"
+	virtualStationRSSI  = -30
+	virtualWiFiChannel  = 1
 )
 
 type Transport interface {
@@ -52,6 +55,7 @@ type Emulator struct {
 	config                Config
 	defaultBaud           int
 	currentBaud           int
+	stationSSID           string
 	echo                  bool
 	mux                   bool
 	cipdInfo              bool
@@ -98,6 +102,7 @@ func New(logger *slog.Logger, config Config) *Emulator {
 		config:      config,
 		defaultBaud: config.Baud,
 		currentBaud: config.Baud,
+		stationSSID: defaultStationSSID,
 		echo:        true,
 	}
 }

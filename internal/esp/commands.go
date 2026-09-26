@@ -12,12 +12,13 @@ import (
 )
 
 var (
-	responseOK         = []byte("\r\nOK\r\n")
-	responseError      = []byte("\r\nERROR\r\n")
-	responseSendPrompt = []byte("\r\nOK\r\n>")
-	responseSendOK     = []byte("\r\nSEND OK\r\n")
-	responseSendFail   = []byte("\r\nSEND FAIL\r\n")
-	responseReset      = []byte("\r\nOK\r\nWIFI CONNECTED\r\nWIFI GOT IP\r\n\r\nready\r\n")
+	responseOK            = []byte("\r\nOK\r\n")
+	responseError         = []byte("\r\nERROR\r\n")
+	responseSendPrompt    = []byte("\r\nOK\r\n>")
+	responseSendOK        = []byte("\r\nSEND OK\r\n")
+	responseSendFail      = []byte("\r\nSEND FAIL\r\n")
+	responseReset         = []byte("\r\nOK\r\nWIFI CONNECTED\r\nWIFI GOT IP\r\n\r\nready\r\n")
+	responseWiFiConnected = []byte("\r\nWIFI CONNECTED\r\nWIFI GOT IP\r\n\r\nOK\r\n")
 )
 
 type commandResult struct {
@@ -80,6 +81,10 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 		return result
 	case "AT+CIFSR":
 		return e.executeCIFSR()
+	case "AT+CWLAP":
+		return e.executeCWLAP()
+	case "AT+CWJAP":
+		return accepted(responseWiFiConnected, "WIFI CONNECTED + WIFI GOT IP + OK")
 	case "AT+CIPMUX?":
 		value := 0
 		if e.mux {
@@ -136,6 +141,9 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 	if result, matched := e.executeCWMODECommand(command, upper); matched {
 		return result
 	}
+	if result, matched := e.executeCWJAPCommand(command, upper); matched {
+		return result
+	}
 	if strings.HasPrefix(upper, "AT+CIPSTART=") {
 		return e.executeCIPStart(ctx, command)
 	}
@@ -178,13 +186,52 @@ func (e *Emulator) executeCWMODECommand(command, upper string) (commandResult, b
 }
 
 func (e *Emulator) executeCIFSR() commandResult {
+	info := e.currentStationInfo()
+	response := fmt.Sprintf("\r\n+CIFSR:STAIP,%q\r\n+CIFSR:STAMAC,%q\r\n\r\nOK\r\n", info.IPAddress, info.MACAddress)
+	return accepted([]byte(response), "station IP and MAC + OK")
+}
+
+func (e *Emulator) executeCWLAP() commandResult {
+	info := e.currentStationInfo()
+	response := fmt.Sprintf("\r\n+CWLAP:(0,%q,%d,%q,%d)\r\n\r\nOK\r\n",
+		e.stationSSID, virtualStationRSSI, info.MACAddress, virtualWiFiChannel)
+	return accepted([]byte(response), "1 virtual access point + OK")
+}
+
+func (e *Emulator) executeCWJAPCommand(command, upper string) (commandResult, bool) {
+	queries := map[string]string{
+		"AT+CWJAP?":     "+CWJAP",
+		"AT+CWJAP_CUR?": "+CWJAP_CUR",
+		"AT+CWJAP_DEF?": "+CWJAP_DEF",
+	}
+	if label, ok := queries[upper]; ok {
+		info := e.currentStationInfo()
+		response := fmt.Sprintf("\r\n%s:%q,%q,%d,%d\r\n\r\nOK\r\n",
+			label, e.stationSSID, info.MACAddress, virtualWiFiChannel, virtualStationRSSI)
+		return accepted([]byte(response), label+" virtual station + OK"), true
+	}
+
+	for _, prefix := range []string{"AT+CWJAP=", "AT+CWJAP_CUR=", "AT+CWJAP_DEF="} {
+		if !strings.HasPrefix(upper, prefix) {
+			continue
+		}
+		ssid, err := parseCWJAP(command[len(prefix):])
+		if err != nil {
+			return rejected(responseError, "ERROR", err.Error()), true
+		}
+		e.stationSSID = ssid
+		return accepted(responseWiFiConnected, "WIFI CONNECTED + WIFI GOT IP + OK"), true
+	}
+	return commandResult{}, false
+}
+
+func (e *Emulator) currentStationInfo() StationInfo {
 	info, err := e.config.StationInfo()
 	if err != nil {
 		e.logger.Warn("station interface discovery failed", "error", err)
-		info = StationInfo{IPAddress: "0.0.0.0", MACAddress: "00:00:00:00:00:00"}
+		return StationInfo{IPAddress: "0.0.0.0", MACAddress: "00:00:00:00:00:00"}
 	}
-	response := fmt.Sprintf("\r\n+CIFSR:STAIP,%q\r\n+CIFSR:STAMAC,%q\r\n\r\nOK\r\n", info.IPAddress, info.MACAddress)
-	return accepted([]byte(response), "station IP and MAC + OK")
+	return info
 }
 
 func (e *Emulator) executeUARTCommand(command, upper string) (commandResult, bool) {
@@ -403,6 +450,30 @@ func parseUARTSettings(value string) (uartSettings, error) {
 		baud: parsed[0], dataBits: parsed[1], stopBits: parsed[2],
 		parity: parsed[3], flowControl: parsed[4],
 	}, nil
+}
+
+func parseCWJAP(value string) (string, error) {
+	reader := csv.NewReader(strings.NewReader(value))
+	reader.FieldsPerRecord = -1
+	reader.TrimLeadingSpace = true
+	fields, err := reader.Read()
+	if err != nil {
+		return "", fmt.Errorf("invalid CWJAP arguments")
+	}
+	if _, err := reader.Read(); err != io.EOF {
+		return "", fmt.Errorf("invalid CWJAP arguments")
+	}
+	if len(fields) < 2 {
+		return "", fmt.Errorf("CWJAP requires SSID and password")
+	}
+	ssid := fields[0]
+	if ssid == "" || len(ssid) > 32 {
+		return "", fmt.Errorf("CWJAP SSID must contain 1 to 32 bytes")
+	}
+	if len(fields[1]) > 64 {
+		return "", fmt.Errorf("CWJAP password must not exceed 64 bytes")
+	}
+	return ssid, nil
 }
 
 func parseCIPStart(command string) (cipStartArguments, error) {

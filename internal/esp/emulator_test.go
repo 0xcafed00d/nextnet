@@ -115,8 +115,8 @@ func TestEmulatorLogsCommandsAndRedactsCredentials(t *testing.T) {
 	if strings.Contains(text, "network") || strings.Contains(text, "secret") {
 		t.Fatalf("credentials leaked into log: %s", text)
 	}
-	if !strings.Contains(text, "AT unsupported") {
-		t.Fatalf("unsupported marker missing from log: %s", text)
+	if !strings.Contains(text, "AT supported") {
+		t.Fatalf("supported marker missing from log: %s", text)
 	}
 }
 

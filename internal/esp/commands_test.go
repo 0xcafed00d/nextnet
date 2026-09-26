@@ -3,6 +3,7 @@ package esp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -125,8 +126,49 @@ func TestWiFiStationCompatibilityCommands(t *testing.T) {
 		}
 	}
 
-	result := emulator.executeCommand(context.Background(), "AT+CIFSR")
-	want := "\r\n+CIFSR:STAIP,\"192.0.2.10\"\r\n+CIFSR:STAMAC,\"02:00:00:00:00:01\"\r\n\r\nOK\r\n"
+	result := emulator.executeCommand(context.Background(), "AT+CWLAP")
+	want := "\r\n+CWLAP:(0,\"MiSTer\",-30,\"02:00:00:00:00:01\",1)\r\n\r\nOK\r\n"
+	if !result.known || result.rejected != "" || string(result.response) != want {
+		t.Fatalf("AT+CWLAP response = %q, rejected %q", result.response, result.rejected)
+	}
+
+	for _, tc := range []struct {
+		command string
+		label   string
+	}{
+		{command: "AT+CWJAP?", label: "+CWJAP"},
+		{command: "AT+CWJAP_CUR?", label: "+CWJAP_CUR"},
+		{command: "AT+CWJAP_DEF?", label: "+CWJAP_DEF"},
+	} {
+		result = emulator.executeCommand(context.Background(), tc.command)
+		want = fmt.Sprintf("\r\n%s:\"MiSTer\",\"02:00:00:00:00:01\",1,-30\r\n\r\nOK\r\n", tc.label)
+		if !result.known || result.rejected != "" || string(result.response) != want {
+			t.Errorf("%s response = %q, rejected %q", tc.command, result.response, result.rejected)
+		}
+	}
+
+	result = emulator.executeCommand(context.Background(), `AT+CWJAP_CUR="Home Network","super-secret"`)
+	want = "\r\nWIFI CONNECTED\r\nWIFI GOT IP\r\n\r\nOK\r\n"
+	if !result.known || result.rejected != "" || string(result.response) != want {
+		t.Fatalf("AT+CWJAP_CUR response = %q, rejected %q", result.response, result.rejected)
+	}
+	if strings.Contains(string(result.response), "super-secret") {
+		t.Fatal("CWJAP response exposed the supplied password")
+	}
+	result = emulator.executeCommand(context.Background(), "AT+CWJAP?")
+	if !strings.Contains(string(result.response), `+CWJAP:"Home Network"`) {
+		t.Fatalf("CWJAP query did not retain virtual SSID: %q", result.response)
+	}
+
+	for _, command := range []string{`AT+CWJAP=""`, `AT+CWJAP="name"`} {
+		result = emulator.executeCommand(context.Background(), command)
+		if !result.known || result.rejected == "" || string(result.response) != string(responseError) {
+			t.Errorf("invalid join command %q was not rejected: %+v", command, result)
+		}
+	}
+
+	result = emulator.executeCommand(context.Background(), "AT+CIFSR")
+	want = "\r\n+CIFSR:STAIP,\"192.0.2.10\"\r\n+CIFSR:STAMAC,\"02:00:00:00:00:01\"\r\n\r\nOK\r\n"
 	if !result.known || result.rejected != "" || string(result.response) != want {
 		t.Fatalf("AT+CIFSR response = %q, rejected %q", result.response, result.rejected)
 	}

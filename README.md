@@ -27,8 +27,8 @@ stages:
 - hardware ESP reset detection through CTS when used with the patched ZXNext
   core, including socket teardown and a clean emulator restart
 - optional `CIPSTART` TCP keepalive intervals
-- station-mode Wi-Fi compatibility through `CWMODE`, with MiSTer Linux IP and
-  MAC reporting through `CIFSR`
+- virtual station-mode Wi-Fi compatibility through `CWMODE`, `CWLAP`, and
+  `CWJAP`, with MiSTer Linux IP and MAC reporting through `CIFSR`
 - `CIPDINFO` and `CIPRECVMODE` initialization compatibility
 - mux-aware `CONNECT`, `+IPD`, and `CLOSED` notifications
 - `CIPSTATUS` reporting for active connections
@@ -227,7 +227,7 @@ time=... level=INFO msg="AT -> ERROR"
 ```
 
 `ATE0` disables UART command echo but does not disable console logging.
-Credential-bearing `AT+CWJAP*=` commands are logged as `<redacted>`. Future
+Credential-bearing `AT+CWJAP*=` commands are logged as `<redacted>`. Supplied
 Wi-Fi credentials are never written to logs. `CIPSEND` payloads and incoming
 network data are logged by length rather than content.
 
@@ -286,6 +286,14 @@ AT+CWMODE_DEF?
 AT+CWMODE=1
 AT+CWMODE_CUR=1
 AT+CWMODE_DEF=1
+AT+CWLAP
+AT+CWJAP
+AT+CWJAP?
+AT+CWJAP_CUR?
+AT+CWJAP_DEF?
+AT+CWJAP="ssid","password"
+AT+CWJAP_CUR="ssid","password"
+AT+CWJAP_DEF="ssid","password"
 AT+CIFSR
 
 AT+CIPMUX?
@@ -338,9 +346,13 @@ configured startup value.
 
 `CWMODE`, `CWMODE_CUR`, and `CWMODE_DEF` expose station mode (`1`), because
 the MiSTer host supplies the network connection and nextnet does not emulate a
-Wi-Fi access point. `AT+CIFSR` reports an active non-loopback IPv4 address and
-MAC address from MiSTer Linux. If no suitable interface can be discovered, it
-returns `0.0.0.0` and `00:00:00:00:00:00` while keeping the AT session alive.
+real Wi-Fi radio. `AT+CWLAP` reports one virtual open access point named
+`MiSTer`, using the host interface MAC address. `CWJAP` query and join variants
+report or update the virtual SSID and emulate a successful connection without
+reconfiguring Linux or retaining the supplied password. `AT+CIFSR` reports an
+active non-loopback IPv4 address and MAC address from MiSTer Linux. If no
+suitable interface can be discovered, it returns `0.0.0.0` and
+`00:00:00:00:00:00` while keeping the AT session alive.
 
 ## MiSTer acceptance tests
 
