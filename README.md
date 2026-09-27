@@ -57,3 +57,12 @@ the `nextnet-mister` folder from the SD card.
 - telnet-v1.51
 
 Raise an issue if you encounter any Next network programs that do not work with nextnet.
+
+## Note 
+In order for nextnet to reset correctly, it needs a change to the ZX Spectrum Next core. This change is pending and will be included in a future core update.
+Until then if the nextnet gets into an incorrect state, you may need to force a reset by closing the Next core and restarting it.
+
+## version history 
+
+### v0.1.0
+- Initial public release
