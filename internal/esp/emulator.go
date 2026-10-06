@@ -22,6 +22,7 @@ const (
 	defaultDialTimeout  = 10 * time.Second
 	defaultWriteTimeout = 10 * time.Second
 	transparentGuard    = 20 * time.Millisecond
+	passiveBufferSize   = 5760
 	defaultStationSSID  = "MiSTer"
 	virtualStationRSSI  = -30
 	virtualWiFiChannel  = 1
@@ -45,6 +46,7 @@ type Config struct {
 	SetBaud      func(int) error
 	StationInfo  func() (StationInfo, error)
 	Dialer       sockets.Dialer
+	Listener     sockets.Listener
 	DialTimeout  time.Duration
 	WriteTimeout time.Duration
 	MaxSendSize  int
@@ -60,6 +62,7 @@ type Emulator struct {
 	mux                   bool
 	cipdInfo              bool
 	passiveReceive        bool
+	serverTimeout         int
 	transparentConfigured bool
 	transparentActive     atomic.Bool
 	transparentPluses     int
@@ -69,6 +72,11 @@ type Emulator struct {
 	payloadSocketID       int
 	payload               []byte
 	outputMu              sync.Mutex
+	passiveCond           *sync.Cond
+	passiveData           [sockets.MaxConnectionID + 1][]byte
+	passiveNotified       [sockets.MaxConnectionID + 1]bool
+	passiveClosed         [sockets.MaxConnectionID + 1]bool
+	passiveLinks          [sockets.MaxConnectionID + 1]sockets.Link
 	socketManager         *sockets.Manager
 }
 
@@ -97,7 +105,7 @@ func New(logger *slog.Logger, config Config) *Emulator {
 			KeepAlive: 30 * time.Second,
 		}
 	}
-	return &Emulator{
+	emulator := &Emulator{
 		logger:      logger,
 		config:      config,
 		defaultBaud: config.Baud,
@@ -105,6 +113,8 @@ func New(logger *slog.Logger, config Config) *Emulator {
 		stationSSID: defaultStationSSID,
 		echo:        true,
 	}
+	emulator.passiveCond = sync.NewCond(&emulator.outputMu)
+	return emulator
 }
 
 // Serve processes AT commands until the transport closes or the context is
@@ -117,13 +127,25 @@ func (e *Emulator) Serve(ctx context.Context, transport Transport) error {
 
 	output := make(chan outputFrame, outputFrames)
 	e.socketManager = sockets.New(e.config.Dialer, sockets.Events{
+		Connected: func(link sockets.Link) {
+			e.emitConnected(serveCtx, output, link)
+		},
 		Data: func(link sockets.Link, payload []byte) {
 			e.emitIPD(serveCtx, output, link, payload)
 		},
 		Closed: func(link sockets.Link) {
-			e.emitClosed(serveCtx, output, link)
+			e.emitClosed(serveCtx, output, link, "remote")
 		},
-	}, e.config.WriteTimeout)
+		TimedOut: func(link sockets.Link) {
+			e.emitClosed(serveCtx, output, link, "timeout")
+		},
+		ServerError: func(err error) {
+			e.logger.Warn("TCP server stopped", "error", err)
+		},
+		ServerRejected: func(remote string) {
+			e.logger.Warn("TCP server client rejected", "remote", remote, "reason", "no free connection ID")
+		},
+	}, e.config.WriteTimeout, e.config.Listener)
 
 	writerDone := make(chan error, 1)
 	go func() {
@@ -139,7 +161,8 @@ func (e *Emulator) Serve(ctx context.Context, transport Transport) error {
 	go func() {
 		select {
 		case <-serveCtx.Done():
-			e.socketManager.CloseAll()
+			e.socketManager.Shutdown()
+			e.wakePassiveReceivers()
 			_ = transport.Close()
 		case <-closeOnCancelDone:
 		}
@@ -195,7 +218,8 @@ readLoop:
 	}
 
 	cancel()
-	e.socketManager.CloseAll()
+	e.socketManager.Shutdown()
+	e.wakePassiveReceivers()
 	_ = transport.Close()
 	e.socketManager.Wait()
 	close(output)
@@ -391,10 +415,43 @@ func (e *Emulator) processPayloadByte(ctx context.Context, output chan<- outputF
 
 func (e *Emulator) emitIPD(ctx context.Context, output chan<- outputFrame, link sockets.Link, payload []byte) {
 	e.outputMu.Lock()
-	frame := append([]byte(nil), payload...)
+	if e.socketManager != nil && !e.socketManager.Active(link) {
+		e.outputMu.Unlock()
+		return
+	}
 	// CIPMODE=1 selects passthrough receiving mode immediately. Bare CIPSEND
 	// separately enables passthrough transmission from UART to the socket.
 	transparent := e.transparentConfigured && link.ID == 0 && !link.Multiplexed
+	for !transparent && e.passiveReceive && len(e.passiveData[link.ID]) > 0 &&
+		len(e.passiveData[link.ID])+len(payload) > passiveBufferSize && ctx.Err() == nil {
+		e.passiveCond.Wait()
+	}
+	if ctx.Err() != nil {
+		e.outputMu.Unlock()
+		return
+	}
+	if e.socketManager != nil && !e.socketManager.Active(link) {
+		e.outputMu.Unlock()
+		return
+	}
+	if !transparent && e.passiveReceive {
+		e.socketManager.Hold(link.ID)
+		e.passiveLinks[link.ID] = link
+		e.passiveData[link.ID] = append(e.passiveData[link.ID], payload...)
+		var err error
+		if !e.passiveNotified[link.ID] {
+			e.passiveNotified[link.ID] = true
+			frame := passiveIPDFrame(link, len(e.passiveData[link.ID]))
+			err = enqueue(ctx, output, frame)
+		}
+		e.outputMu.Unlock()
+		if err == nil {
+			e.logger.Info("socket received", "id", link.ID, "bytes", len(payload), "passive", true)
+		}
+		return
+	}
+
+	frame := append([]byte(nil), payload...)
 	if !transparent {
 		frame = make([]byte, 0, len(payload)+64)
 		frame = append(frame, "+IPD,"...)
@@ -416,12 +473,51 @@ func (e *Emulator) emitIPD(ctx context.Context, output chan<- outputFrame, link 
 	err := enqueue(ctx, output, frame)
 	e.outputMu.Unlock()
 	if err == nil {
-		e.logger.Info("socket received", "id", link.ID, "bytes", len(payload), "transparent", transparent)
+		e.logger.Info("socket received", "id", link.ID, "bytes", len(payload), "transparent", transparent, "passive", false)
 	}
 }
 
-func (e *Emulator) emitClosed(ctx context.Context, output chan<- outputFrame, link sockets.Link) {
+func passiveIPDFrame(link sockets.Link, length int) []byte {
+	frame := make([]byte, 0, 32)
+	frame = append(frame, "+IPD,"...)
+	if link.Multiplexed {
+		frame = strconv.AppendInt(frame, int64(link.ID), 10)
+		frame = append(frame, ',')
+	}
+	frame = strconv.AppendInt(frame, int64(length), 10)
+	frame = append(frame, '\r', '\n')
+	return frame
+}
+
+func (e *Emulator) emitConnected(ctx context.Context, output chan<- outputFrame, link sockets.Link) {
 	e.outputMu.Lock()
+	if e.socketManager != nil && !e.socketManager.Active(link) {
+		e.outputMu.Unlock()
+		return
+	}
+	frame := connectionEvent(link.ID, "CONNECT", link.Multiplexed)
+	err := enqueue(ctx, output, frame)
+	e.outputMu.Unlock()
+	if err == nil {
+		e.logger.Info("server client connected",
+			"id", link.ID,
+			"network", "tcp",
+			"host", link.RemoteHost,
+			"port", link.RemotePort,
+		)
+	}
+}
+
+func (e *Emulator) emitClosed(ctx context.Context, output chan<- outputFrame, link sockets.Link, cause string) {
+	e.outputMu.Lock()
+	if len(e.passiveData[link.ID]) > 0 {
+		buffered := len(e.passiveData[link.ID])
+		e.passiveClosed[link.ID] = true
+		e.socketManager.Hold(link.ID)
+		e.outputMu.Unlock()
+		e.logger.Info("socket close deferred", "id", link.ID, "cause", cause, "buffered", buffered)
+		return
+	}
 	wasTransparent := e.transparentActive.Swap(false)
 	frame := []byte("\r\nCLOSED\r\n")
 	if link.Multiplexed {
@@ -430,7 +526,7 @@ func (e *Emulator) emitClosed(ctx context.Context, output chan<- outputFrame, li
 	err := enqueue(ctx, output, frame)
 	e.outputMu.Unlock()
 	if err == nil {
-		e.logger.Info("socket closed", "id", link.ID, "cause", "remote", "transparent", wasTransparent)
+		e.logger.Info("socket closed", "id", link.ID, "cause", cause, "transparent", wasTransparent)
 	}
 }
 
@@ -440,6 +536,10 @@ func (e *Emulator) resetState() {
 	e.mux = false
 	e.cipdInfo = false
 	e.passiveReceive = false
+	e.serverTimeout = 0
+	if e.socketManager != nil {
+		e.socketManager.SetServerTimeout(0)
+	}
 	e.transparentConfigured = false
 	e.transparentActive.Store(false)
 	e.transparentPluses = 0
@@ -448,6 +548,30 @@ func (e *Emulator) resetState() {
 	e.payloadExpected = 0
 	e.payloadSocketID = 0
 	e.payload = nil
+	e.clearAllPassiveData()
+}
+
+func (e *Emulator) clearPassiveData(id int) {
+	e.passiveData[id] = nil
+	e.passiveNotified[id] = false
+	e.passiveClosed[id] = false
+	e.passiveLinks[id] = sockets.Link{}
+	if e.socketManager != nil {
+		e.socketManager.Release(id)
+	}
+	e.passiveCond.Broadcast()
+}
+
+func (e *Emulator) clearAllPassiveData() {
+	for id := sockets.MinConnectionID; id <= sockets.MaxConnectionID; id++ {
+		e.clearPassiveData(id)
+	}
+}
+
+func (e *Emulator) wakePassiveReceivers() {
+	e.outputMu.Lock()
+	e.passiveCond.Broadcast()
+	e.outputMu.Unlock()
 }
 
 func enqueue(ctx context.Context, output chan<- outputFrame, data []byte) error {

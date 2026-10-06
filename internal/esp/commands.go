@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"nextnet/internal/sockets"
 )
@@ -49,6 +50,18 @@ type cipSendArguments struct {
 	length int
 }
 
+type cipServerArguments struct {
+	mode             int
+	port             int
+	closeConnections bool
+}
+
+type cipRecvDataArguments struct {
+	id     int
+	hasID  bool
+	length int
+}
+
 func (e *Emulator) executeCommand(ctx context.Context, command string) commandResult {
 	upper := strings.ToUpper(command)
 	switch upper {
@@ -71,7 +84,7 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 		return accepted([]byte(response), "version information + OK")
 	case "AT+RST":
 		if e.socketManager != nil {
-			e.socketManager.CloseAll()
+			e.socketManager.Shutdown()
 		}
 		result := accepted(responseReset, "OK + WIFI CONNECTED + WIFI GOT IP + ready")
 		result.reset = true
@@ -107,11 +120,19 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 	case "AT+CIPRECVMODE?":
 		return modeQueryResult("CIPRECVMODE", e.passiveReceive)
 	case "AT+CIPRECVMODE=0":
+		for id := sockets.MinConnectionID; id <= sockets.MaxConnectionID; id++ {
+			if len(e.passiveData[id]) > 0 {
+				return rejected(responseError, "ERROR", "cannot disable passive receive while data is buffered")
+			}
+		}
 		e.passiveReceive = false
+		e.passiveCond.Broadcast()
 		return accepted(responseOK, "OK")
 	case "AT+CIPRECVMODE=1":
 		e.passiveReceive = true
 		return accepted(responseOK, "OK")
+	case "AT+CIPRECVLEN?":
+		return e.executeCIPRecvLen()
 	case "AT+CIPMODE?":
 		return modeQueryResult("CIPMODE", e.transparentConfigured)
 	case "AT+CIPMODE=0":
@@ -126,6 +147,11 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 		return accepted(responseOK, "OK")
 	case "AT+CIPSTATUS":
 		return e.executeCIPStatus()
+	case "AT+CIPSERVER?":
+		return e.executeCIPServerQuery()
+	case "AT+CIPSTO?":
+		response := fmt.Sprintf("\r\n+CIPSTO:%d\r\n\r\nOK\r\n", e.serverTimeout)
+		return accepted([]byte(response), fmt.Sprintf("+CIPSTO:%d + OK", e.serverTimeout))
 	case "AT+CIPSEND":
 		return e.executeTransparentCIPSend()
 	case "AT+CIPCLOSE":
@@ -152,6 +178,15 @@ func (e *Emulator) executeCommand(ctx context.Context, command string) commandRe
 	}
 	if strings.HasPrefix(upper, "AT+CIPCLOSE=") {
 		return e.executeMuxCIPClose(command)
+	}
+	if strings.HasPrefix(upper, "AT+CIPSERVER=") {
+		return e.executeCIPServer(ctx, command)
+	}
+	if strings.HasPrefix(upper, "AT+CIPRECVDATA=") {
+		return e.executeCIPRecvData(command)
+	}
+	if strings.HasPrefix(upper, "AT+CIPSTO=") {
+		return e.executeCIPServerTimeout(command)
 	}
 	for _, prefix := range []string{"AT+CIPDINFO=", "AT+CIPRECVMODE=", "AT+CIPMODE="} {
 		if strings.HasPrefix(upper, prefix) {
@@ -288,8 +323,15 @@ func (e *Emulator) executeCIPMux(enabled bool) commandResult {
 	if enabled && e.transparentConfigured {
 		return rejected(responseError, "ERROR", "CIPMUX=1 is incompatible with transparent mode")
 	}
-	if e.mux != enabled && e.socketManager != nil && e.socketManager.Count() > 0 {
-		return rejected(responseError, "ERROR", "cannot change CIPMUX while connections are active")
+	if e.mux != enabled && e.socketManager != nil {
+		if _, serverRunning := e.socketManager.ServerPort(); serverRunning {
+			return rejected(responseError, "ERROR", "cannot change CIPMUX while a TCP server is active")
+		}
+		for id := sockets.MinConnectionID; id <= sockets.MaxConnectionID; id++ {
+			if e.socketManager.InUse(id) {
+				return rejected(responseError, "ERROR", "cannot change CIPMUX while connections are active")
+			}
+		}
 	}
 	e.mux = enabled
 	return accepted(responseOK, "OK")
@@ -383,6 +425,15 @@ func (e *Emulator) executeMuxCIPClose(command string) commandResult {
 	if separator == -1 {
 		return rejected(responseError, "ERROR", "missing connection ID")
 	}
+	if strings.TrimSpace(command[separator+1:]) == "5" {
+		closed := 0
+		if e.socketManager != nil {
+			closed = e.socketManager.CloseAll()
+		}
+		e.clearAllPassiveData()
+		e.logger.Info("sockets closed", "cause", "AT+CIPCLOSE=5", "count", closed)
+		return accepted(responseOK, "OK")
+	}
 	id, err := parseConnectionID(strings.TrimSpace(command[separator+1:]))
 	if err != nil {
 		return rejected(responseError, "ERROR", err.Error())
@@ -391,9 +442,11 @@ func (e *Emulator) executeMuxCIPClose(command string) commandResult {
 }
 
 func (e *Emulator) executeCIPClose(id int) commandResult {
-	if e.socketManager == nil || !e.socketManager.Close(id) {
+	if e.socketManager == nil || !e.socketManager.InUse(id) {
 		return rejected(responseError, "ERROR", fmt.Sprintf("connection ID %d is not active", id))
 	}
+	e.socketManager.Close(id)
+	e.clearPassiveData(id)
 	e.logger.Info("socket closed", "id", id, "cause", "AT+CIPCLOSE")
 	multiplexed := e.mux
 	return accepted(connectionResponse(id, "CLOSED", multiplexed), connectionResponseLog(id, "CLOSED", multiplexed)+" + OK")
@@ -413,16 +466,141 @@ func (e *Emulator) executeCIPStatus() commandResult {
 	response.WriteString(strconv.Itoa(state))
 	response.WriteString("\r\n")
 	for _, status := range statuses {
-		fmt.Fprintf(&response, "+CIPSTATUS:%d,%q,%q,%d,%d,0\r\n",
+		connectionType := 0
+		if status.Inbound {
+			connectionType = 1
+		}
+		fmt.Fprintf(&response, "+CIPSTATUS:%d,%q,%q,%d,%d,%d\r\n",
 			status.ID,
 			status.Network,
 			status.RemoteHost,
 			status.RemotePort,
 			status.LocalPort,
+			connectionType,
 		)
 	}
 	response.WriteString("\r\nOK\r\n")
 	return accepted([]byte(response.String()), fmt.Sprintf("STATUS:%d + %d connection(s) + OK", state, len(statuses)))
+}
+
+func (e *Emulator) executeCIPServerQuery() commandResult {
+	if e.socketManager != nil {
+		if port, running := e.socketManager.ServerPort(); running {
+			response := fmt.Sprintf("\r\n+CIPSERVER:1,%d,\"TCP\"\r\n\r\nOK\r\n", port)
+			return accepted([]byte(response), fmt.Sprintf("+CIPSERVER:1,%d,\"TCP\" + OK", port))
+		}
+	}
+	return accepted([]byte("\r\n+CIPSERVER:0\r\n\r\nOK\r\n"), "+CIPSERVER:0 + OK")
+}
+
+func (e *Emulator) executeCIPServer(ctx context.Context, command string) commandResult {
+	arguments, err := parseCIPServer(command)
+	if err != nil {
+		return rejected(responseError, "ERROR", err.Error())
+	}
+	if e.socketManager == nil {
+		return rejected(responseError, "ERROR", "socket manager is unavailable")
+	}
+	if arguments.mode == 0 {
+		e.socketManager.StopTCPServer(arguments.closeConnections)
+		if arguments.closeConnections {
+			e.clearAllPassiveData()
+		}
+		e.logger.Info("TCP server stopped", "close_connections", arguments.closeConnections)
+		return accepted(responseOK, "OK")
+	}
+	if !e.mux {
+		return rejected(responseError, "ERROR", "TCP server requires CIPMUX=1")
+	}
+	if e.transparentConfigured {
+		return rejected(responseError, "ERROR", "TCP server is incompatible with transparent mode")
+	}
+	if err := e.socketManager.StartTCPServer(ctx, arguments.port); err != nil {
+		e.logger.Warn("TCP server start failed", "port", arguments.port, "error", err)
+		return rejected(responseError, "ERROR", err.Error())
+	}
+	e.logger.Info("TCP server started", "network", "tcp", "port", arguments.port)
+	return accepted(responseOK, "OK")
+}
+
+func (e *Emulator) executeCIPServerTimeout(command string) commandResult {
+	separator := strings.IndexByte(command, '=')
+	if separator == -1 {
+		return rejected(responseError, "ERROR", "missing CIPSTO timeout")
+	}
+	seconds, err := strconv.Atoi(strings.TrimSpace(command[separator+1:]))
+	if err != nil || seconds < 0 || seconds > 7200 {
+		return rejected(responseError, "ERROR", "CIPSTO timeout must be between 0 and 7200 seconds")
+	}
+	e.serverTimeout = seconds
+	if e.socketManager != nil {
+		e.socketManager.SetServerTimeout(time.Duration(seconds) * time.Second)
+	}
+	return accepted(responseOK, "OK")
+}
+
+func (e *Emulator) executeCIPRecvLen() commandResult {
+	response := []byte("\r\n+CIPRECVLEN:")
+	for id := sockets.MinConnectionID; id <= sockets.MaxConnectionID; id++ {
+		if id > sockets.MinConnectionID {
+			response = append(response, ',')
+		}
+		response = strconv.AppendInt(response, int64(len(e.passiveData[id])), 10)
+	}
+	response = append(response, "\r\n\r\nOK\r\n"...)
+	return accepted(response, "buffered socket lengths + OK")
+}
+
+func (e *Emulator) executeCIPRecvData(command string) commandResult {
+	if !e.passiveReceive {
+		return rejected(responseError, "ERROR", "CIPRECVMODE=1 is required")
+	}
+	arguments, err := parseCIPRecvData(command)
+	if err != nil {
+		return rejected(responseError, "ERROR", err.Error())
+	}
+	if arguments.hasID != e.mux {
+		if e.mux {
+			return rejected(responseError, "ERROR", "multiplexed CIPRECVDATA requires a connection ID")
+		}
+		return rejected(responseError, "ERROR", "single-connection CIPRECVDATA must not include an ID")
+	}
+	if e.socketManager == nil || (!e.socketManager.InUse(arguments.id) && len(e.passiveData[arguments.id]) == 0) {
+		return rejected(responseError, "ERROR", fmt.Sprintf("connection ID %d is not active", arguments.id))
+	}
+
+	actualLength := arguments.length
+	if actualLength > len(e.passiveData[arguments.id]) {
+		actualLength = len(e.passiveData[arguments.id])
+	}
+	link := e.passiveLinks[arguments.id]
+	response := []byte("\r\n+CIPRECVDATA:")
+	response = strconv.AppendInt(response, int64(actualLength), 10)
+	response = append(response, ',')
+	if e.cipdInfo && actualLength > 0 {
+		response = strconv.AppendQuote(response, link.RemoteHost)
+		response = append(response, ',')
+		response = strconv.AppendInt(response, int64(link.RemotePort), 10)
+		response = append(response, ',')
+	}
+	response = append(response, e.passiveData[arguments.id][:actualLength]...)
+	e.passiveData[arguments.id] = e.passiveData[arguments.id][actualLength:]
+	e.passiveNotified[arguments.id] = false
+	response = append(response, "\r\n\r\nOK\r\n"...)
+
+	remaining := len(e.passiveData[arguments.id])
+	closed := e.passiveClosed[arguments.id]
+	if remaining > 0 {
+		e.passiveNotified[arguments.id] = true
+		response = append(response, passiveIPDFrame(link, remaining)...)
+	} else {
+		e.clearPassiveData(arguments.id)
+		if closed {
+			response = append(response, connectionEvent(arguments.id, "CLOSED", link.Multiplexed)...)
+		}
+	}
+	e.passiveCond.Broadcast()
+	return accepted(response, fmt.Sprintf("+CIPRECVDATA:%d + OK", actualLength))
 }
 
 type uartSettings struct {
@@ -572,6 +750,82 @@ func parseCIPSend(command string) (cipSendArguments, error) {
 	return arguments, nil
 }
 
+func parseCIPServer(command string) (cipServerArguments, error) {
+	separator := strings.IndexByte(command, '=')
+	if separator == -1 {
+		return cipServerArguments{}, fmt.Errorf("missing CIPSERVER arguments")
+	}
+	reader := csv.NewReader(strings.NewReader(command[separator+1:]))
+	reader.FieldsPerRecord = -1
+	reader.TrimLeadingSpace = true
+	fields, err := reader.Read()
+	if err != nil {
+		return cipServerArguments{}, fmt.Errorf("parse CIPSERVER: %w", err)
+	}
+	if _, err := reader.Read(); err != io.EOF {
+		return cipServerArguments{}, fmt.Errorf("CIPSERVER contains extra records")
+	}
+	if len(fields) == 0 || len(fields) > 3 {
+		return cipServerArguments{}, fmt.Errorf("CIPSERVER requires a mode and optional parameter")
+	}
+	mode, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+	if err != nil || (mode != 0 && mode != 1) {
+		return cipServerArguments{}, fmt.Errorf("CIPSERVER mode must be 0 or 1")
+	}
+	arguments := cipServerArguments{mode: mode, port: 333}
+	if mode == 0 {
+		if len(fields) > 2 {
+			return cipServerArguments{}, fmt.Errorf("CIPSERVER=0 accepts only the optional close-connections flag")
+		}
+		if len(fields) == 2 {
+			closeConnections, err := strconv.Atoi(strings.TrimSpace(fields[1]))
+			if err != nil || (closeConnections != 0 && closeConnections != 1) {
+				return cipServerArguments{}, fmt.Errorf("CIPSERVER close-connections flag must be 0 or 1")
+			}
+			arguments.closeConnections = closeConnections == 1
+		}
+		return arguments, nil
+	}
+
+	if len(fields) >= 2 {
+		arguments.port, err = strconv.Atoi(strings.TrimSpace(fields[1]))
+		if err != nil || arguments.port < 1 || arguments.port > 65535 {
+			return cipServerArguments{}, fmt.Errorf("invalid TCP server port %q", fields[1])
+		}
+	}
+	if len(fields) == 3 && !strings.EqualFold(strings.TrimSpace(fields[2]), "TCP") {
+		return cipServerArguments{}, fmt.Errorf("only TCP servers are implemented")
+	}
+	return arguments, nil
+}
+
+func parseCIPRecvData(command string) (cipRecvDataArguments, error) {
+	separator := strings.IndexByte(command, '=')
+	if separator == -1 {
+		return cipRecvDataArguments{}, fmt.Errorf("missing CIPRECVDATA arguments")
+	}
+	fields := strings.Split(command[separator+1:], ",")
+	arguments := cipRecvDataArguments{id: 0}
+	lengthIndex := 0
+	if len(fields) == 2 {
+		arguments.hasID = true
+		id, err := parseConnectionID(strings.TrimSpace(fields[0]))
+		if err != nil {
+			return cipRecvDataArguments{}, err
+		}
+		arguments.id = id
+		lengthIndex = 1
+	} else if len(fields) != 1 {
+		return cipRecvDataArguments{}, fmt.Errorf("CIPRECVDATA requires a length, with an ID only in multiplexed mode")
+	}
+	length, err := strconv.ParseInt(strings.TrimSpace(fields[lengthIndex]), 10, 32)
+	if err != nil || length <= 0 {
+		return cipRecvDataArguments{}, fmt.Errorf("receive length must be a positive 32-bit integer")
+	}
+	arguments.length = int(length)
+	return arguments, nil
+}
+
 func parseConnectionID(value string) (int, error) {
 	id, err := strconv.Atoi(value)
 	if err != nil || id < sockets.MinConnectionID || id > sockets.MaxConnectionID {
@@ -585,6 +839,13 @@ func connectionResponse(id int, event string, multiplexed bool) []byte {
 		return []byte(fmt.Sprintf("\r\n%d,%s\r\n\r\nOK\r\n", id, event))
 	}
 	return []byte("\r\n" + event + "\r\n\r\nOK\r\n")
+}
+
+func connectionEvent(id int, event string, multiplexed bool) []byte {
+	if multiplexed {
+		return []byte(fmt.Sprintf("\r\n%d,%s\r\n", id, event))
+	}
+	return []byte("\r\n" + event + "\r\n")
 }
 
 func connectionResponseLog(id int, event string, multiplexed bool) string {

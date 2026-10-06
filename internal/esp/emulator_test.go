@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,7 +129,7 @@ func TestAsyncFramesUseConnectionFramingMode(t *testing.T) {
 	link := sockets.Link{ID: 0, Multiplexed: true}
 
 	emulator.emitIPD(context.Background(), output, link, []byte("DATA"))
-	emulator.emitClosed(context.Background(), output, link)
+	emulator.emitClosed(context.Background(), output, link, "remote")
 	if got := string((<-output).data); got != "+IPD,0,4:DATA" {
 		t.Fatalf("delayed mux IPD = %q", got)
 	}
@@ -153,7 +155,7 @@ func TestRemoteCloseLeavesTransparentMode(t *testing.T) {
 	emulator.transparentActive.Store(true)
 	output := make(chan outputFrame, 1)
 
-	emulator.emitClosed(context.Background(), output, sockets.Link{ID: 0})
+	emulator.emitClosed(context.Background(), output, sockets.Link{ID: 0}, "remote")
 	if emulator.transparentActive.Load() {
 		t.Fatal("transparent mode remained active after remote close")
 	}
@@ -476,6 +478,119 @@ func TestEmulatorMultiplexedTCP(t *testing.T) {
 	}
 }
 
+func TestEmulatorInboundTCPServerWithPassiveReceive(t *testing.T) {
+	var logs bytes.Buffer
+	listener := newESPPipeListener(&net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 80})
+	emulatorSide, clientSide := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- New(slog.New(slog.NewTextHandler(&logs, nil)), Config{
+			Version: "test",
+			Baud:    115200,
+			Listener: espListenerFunc(func(_ context.Context, network, address string) (net.Listener, error) {
+				if network != "tcp" || address != ":80" {
+					return nil, fmt.Errorf("listen = %q %q, want tcp :80", network, address)
+				}
+				return listener, nil
+			}),
+		}).Serve(ctx, emulatorSide)
+	}()
+
+	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSERVER=0\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMODE=0\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPMUX=1\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPRECVMODE=1\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPDINFO=0\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSERVER=1,80\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSTO=30\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSTO?\r\n", "\r\n+CIPSTO:30\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSERVER?\r\n", "\r\n+CIPSERVER:1,80,\"TCP\"\r\n\r\nOK\r\n")
+
+	remote, server := net.Pipe()
+	listener.offer(&espAddressedConn{
+		Conn:   server,
+		local:  listener.Addr(),
+		remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 4567},
+	})
+	readExact(t, clientSide, "\r\n0,CONNECT\r\n")
+	wantStatus := "\r\nSTATUS:3\r\n+CIPSTATUS:0,\"TCP\",\"192.0.2.20\",4567,80,1\r\n\r\nOK\r\n"
+	testExchange(t, clientSide, "AT+CIPSTATUS\r\n", wantStatus)
+
+	if _, err := remote.Write([]byte("HELLO")); err != nil {
+		t.Fatal(err)
+	}
+	readExact(t, clientSide, "+IPD,0,5\r\n")
+	if _, err := remote.Write([]byte("!!")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	testExchange(t, clientSide, "AT+CIPRECVLEN?\r\n", "\r\n+CIPRECVLEN:7,0,0,0,0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPRECVDATA=0,4\r\n", "\r\n+CIPRECVDATA:4,HELL\r\n\r\nOK\r\n+IPD,0,3\r\n")
+	testExchange(t, clientSide, "AT+CIPRECVDATA=0,10\r\n", "\r\n+CIPRECVDATA:3,O!!\r\n\r\nOK\r\n")
+
+	request := []byte("WORLD")
+	received := make(chan []byte, 1)
+	go func() {
+		payload := make([]byte, len(request))
+		_, _ = io.ReadFull(remote, payload)
+		received <- payload
+	}()
+	if _, err := clientSide.Write(append([]byte("AT+CIPSEND=0,5\r\n"), request...)); err != nil {
+		t.Fatal(err)
+	}
+	readExact(t, clientSide, "\r\nOK\r\n>\r\nSEND OK\r\n")
+	gotRequest := <-received
+	if !bytes.Equal(gotRequest, request) {
+		t.Fatalf("server response payload = %q, want %q", gotRequest, request)
+	}
+
+	if _, err := remote.Write([]byte("BYE")); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readExact(t, clientSide, "+IPD,0,3\r\n")
+	time.Sleep(10 * time.Millisecond)
+	testExchange(t, clientSide, "AT+CIPRECVDATA=0,10\r\n", "\r\n+CIPRECVDATA:3,BYE\r\n\r\nOK\r\n\r\n0,CLOSED\r\n")
+
+	remote2, server2 := net.Pipe()
+	listener.offer(&espAddressedConn{
+		Conn:   server2,
+		local:  listener.Addr(),
+		remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.21"), Port: 4568},
+	})
+	readExact(t, clientSide, "\r\n0,CONNECT\r\n")
+	testExchange(t, clientSide, "AT+CIPCLOSE=5\r\n", "\r\nOK\r\n")
+	buffer := make([]byte, 1)
+	if _, err := remote2.Read(buffer); !errors.Is(err, io.EOF) {
+		t.Fatalf("second client read after CIPCLOSE=5 = %v, want EOF", err)
+	}
+	_ = remote2.Close()
+	testExchange(t, clientSide, "AT+CIPSERVER?\r\n", "\r\n+CIPSERVER:1,80,\"TCP\"\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSERVER=0\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSERVER?\r\n", "\r\n+CIPSERVER:0\r\n\r\nOK\r\n")
+
+	cancel()
+	_ = clientSide.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop after inbound server test")
+	}
+
+	for _, fragment := range []string{"TCP server started", "server client connected", "passive=true", "socket close deferred", "TCP server stopped"} {
+		if !strings.Contains(logs.String(), fragment) {
+			t.Fatalf("server log is missing %q: %s", fragment, logs.String())
+		}
+	}
+}
+
 func TestEmulatorRejectsConnectionSyntaxForWrongMuxMode(t *testing.T) {
 	serverConnections := make(chan net.Conn, 1)
 	dialer := espDialerFunc(func(context.Context, string, string) (net.Conn, error) {
@@ -533,6 +648,7 @@ func TestEmulatorResetClosesEveryMultiplexedSocket(t *testing.T) {
 
 	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
 	testExchange(t, clientSide, "AT+CIPMUX=1\r\n", "\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSTO=30\r\n", "\r\nOK\r\n")
 	testExchange(t, clientSide, `AT+CIPSTART=0,"TCP","zero.test",80`+"\r\n", "\r\n0,CONNECT\r\n\r\nOK\r\n")
 	peer0 := <-serverConnections
 	testExchange(t, clientSide, `AT+CIPSTART=4,"TCP","four.test",80`+"\r\n", "\r\n4,CONNECT\r\n\r\nOK\r\n")
@@ -548,6 +664,7 @@ func TestEmulatorResetClosesEveryMultiplexedSocket(t *testing.T) {
 	}
 	testExchange(t, clientSide, "ATE0\r\n", "ATE0\r\n\r\nOK\r\n")
 	testExchange(t, clientSide, "AT+CIPMUX?\r\n", "\r\n+CIPMUX:0\r\n\r\nOK\r\n")
+	testExchange(t, clientSide, "AT+CIPSTO?\r\n", "\r\n+CIPSTO:0\r\n\r\nOK\r\n")
 	testExchange(t, clientSide, "AT+CIPSTATUS\r\n", "\r\nSTATUS:2\r\n\r\nOK\r\n")
 
 	cancel()
@@ -637,3 +754,58 @@ type espDialerFunc func(context.Context, string, string) (net.Conn, error)
 func (function espDialerFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	return function(ctx, network, address)
 }
+
+type espListenerFunc func(context.Context, string, string) (net.Listener, error)
+
+func (function espListenerFunc) Listen(ctx context.Context, network, address string) (net.Listener, error) {
+	return function(ctx, network, address)
+}
+
+type espPipeListener struct {
+	connections chan net.Conn
+	closed      chan struct{}
+	closeOnce   sync.Once
+	address     net.Addr
+}
+
+func newESPPipeListener(address net.Addr) *espPipeListener {
+	return &espPipeListener{
+		connections: make(chan net.Conn, 5),
+		closed:      make(chan struct{}),
+		address:     address,
+	}
+}
+
+func (listener *espPipeListener) offer(connection net.Conn) {
+	listener.connections <- connection
+}
+
+func (listener *espPipeListener) Accept() (net.Conn, error) {
+	select {
+	case <-listener.closed:
+		return nil, net.ErrClosed
+	default:
+	}
+	select {
+	case connection := <-listener.connections:
+		return connection, nil
+	case <-listener.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (listener *espPipeListener) Close() error {
+	listener.closeOnce.Do(func() { close(listener.closed) })
+	return nil
+}
+
+func (listener *espPipeListener) Addr() net.Addr { return listener.address }
+
+type espAddressedConn struct {
+	net.Conn
+	local  net.Addr
+	remote net.Addr
+}
+
+func (connection *espAddressedConn) LocalAddr() net.Addr  { return connection.local }
+func (connection *espAddressedConn) RemoteAddr() net.Addr { return connection.remote }

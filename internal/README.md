@@ -5,8 +5,8 @@ software running in the ZX Spectrum Next MiSTer core. It uses the core's UART0
 path and MiSTer's Linux networking stack.
 
 The UART path and fixed-length single-connection TCP stage are hardware-proven.
-The repository now also contains host-tested multiplexed and transparent TCP
-stages:
+The repository now also contains host-tested multiplexed, transparent, and
+inbound TCP stages:
 
 - exact active-core detection through `/tmp/CORENAME`
 - raw Linux serial setup (115200 8N1 by default)
@@ -21,6 +21,8 @@ stages:
   `CIPCLOSE`
 - up to five simultaneous TCP connections through `CIPMUX=1` and link IDs
   `0` through `4`
+- one inbound TCP listener through `CIPSERVER`, with accepted clients assigned
+  the lowest available multiplexed link ID
 - fixed-length, binary-safe `CIPSEND` payload handling up to 64 KiB
 - single-connection transparent TCP through `CIPMODE=1` and bare `CIPSEND`
 - raw bidirectional UART/TCP forwarding with `+++` escape handling
@@ -29,7 +31,8 @@ stages:
 - optional `CIPSTART` TCP keepalive intervals
 - virtual station-mode Wi-Fi compatibility through `CWMODE`, `CWLAP`, and
   `CWJAP`, with MiSTer Linux IP and MAC reporting through `CIFSR`
-- `CIPDINFO` and `CIPRECVMODE` initialization compatibility
+- active and passive socket receive modes through `CIPRECVMODE`,
+  `CIPRECVDATA`, and `CIPRECVLEN`
 - mux-aware `CONNECT`, `+IPD`, and `CLOSED` notifications
 - `CIPSTATUS` reporting for active connections
 - bounded socket-to-UART backpressure and clean socket shutdown
@@ -37,8 +40,7 @@ stages:
   unsupported command
 - credential redaction for `AT+CWJAP*` commands
 
-UDP, inbound TCP servers, passive `CIPRECVDATA` buffering, and real Wi-Fi
-configuration are not implemented.
+UDP, SSL, and real Wi-Fi configuration are not implemented.
 
 ## Verified MiSTer hardware
 
@@ -53,9 +55,9 @@ Testing on a real MiSTer with the ZXNext core established that:
   `nextnet`.
 - GETIT also completed network downloads successfully.
 
-These applications prove the `CIPMUX=0` path on hardware. Multiplexed sockets
-remain host-tested until a suitable real Next application or UART fixture is
-run against them.
+These applications prove the `CIPMUX=0` path on hardware. Multiplexed sockets,
+inbound servers, and passive reception remain host-tested until a suitable real
+Next application or UART fixture is run against them.
 
 The serial device remains configurable because this one-system result is not a
 guarantee for every MiSTer installation.
@@ -307,9 +309,21 @@ AT+CIPDINFO=1
 AT+CIPRECVMODE?
 AT+CIPRECVMODE=0
 AT+CIPRECVMODE=1
+AT+CIPRECVLEN?
+AT+CIPRECVDATA=length
+AT+CIPRECVDATA=id,length
 AT+CIPMODE?
 AT+CIPMODE=0
 AT+CIPMODE=1
+
+AT+CIPSERVER?
+AT+CIPSERVER=0
+AT+CIPSERVER=0,close_connections
+AT+CIPSERVER=1
+AT+CIPSERVER=1,port
+AT+CIPSERVER=1,port,"TCP"
+AT+CIPSTO?
+AT+CIPSTO=timeout_seconds
 
 AT+CIPSTART="TCP","host",port
 AT+CIPSTART="TCP","host",port,keepalive_seconds
@@ -321,6 +335,7 @@ AT+CIPSTART=id,"TCP","host",port
 AT+CIPSTART=id,"TCP","host",port,keepalive_seconds
 AT+CIPSEND=id,length
 AT+CIPCLOSE=id
+AT+CIPCLOSE=5
 ```
 
 With `CIPMUX=0`, `CIPMODE=1` enables transparent receiving for an active TCP
@@ -331,11 +346,26 @@ after it, and less than 20 ms between pluses) exits transparent transmission
 without forwarding those three bytes. AT commands can then be used again while
 TCP-to-UART reception remains transparent.
 
-`CIPRECVMODE=0/1` is stored and reported so applications can complete their
-initialization. Passive receive buffering and `CIPRECVDATA` are not yet
-implemented; `CIPMODE=1` uses transparent raw reception, and normal mode keeps
-using unsolicited `+IPD` frames. `CIPDINFO=1` adds the remote address and port
-to normal-mode `+IPD` headers.
+`CIPRECVMODE=0` sends socket payloads immediately in unsolicited `+IPD`
+frames. `CIPRECVMODE=1` retains TCP data in a bounded buffer and reports the
+available length; applications retrieve binary-safe chunks with
+`CIPRECVDATA`, while `CIPRECVLEN?` reports all five buffered lengths. A remote
+`CLOSED` notification is deferred until its buffered data has been read.
+`CIPDINFO=1` adds the remote address and port to active-mode `+IPD` headers and
+passive `CIPRECVDATA` responses. `CIPMODE=1` continues to use transparent raw
+reception instead of passive buffering.
+
+`AT+CIPSERVER=1,port` listens on all MiSTer network interfaces and requires
+`CIPMUX=1`. One TCP server can run at a time. Incoming clients take the lowest
+free ID from `0` through `4`, emit `id,CONNECT`, and then use the same
+`CIPSEND`, `CIPCLOSE`, `CIPSTATUS`, and receive paths as outgoing sockets.
+`CIPSERVER=0` stops accepting clients but preserves existing connections;
+`CIPSERVER=0,1` also closes connections. `CIPCLOSE=5` closes every connection
+without stopping the listener. `CIPSTO` sets an inactivity timeout from 0 to
+7200 seconds for accepted clients; incoming client traffic restarts the timer,
+while data sent by the server does not. A value of `0` disables the timeout.
+The listener and all clients are always closed on ESP reset, core exit, or
+daemon shutdown.
 
 `AT+UART_CUR` and legacy `AT+UART` accept rates from 80 through 5000000 baud
 with raw 8N1/no-flow-control framing. nextnet sends and drains `OK` at the old
@@ -398,9 +428,11 @@ serial closed; bridge idle
 ZXDB-dl and GETIT are the current `CIPMUX=0` regression applications. A mux
 acceptance run should open two IDs, send data independently with
 `AT+CIPSEND=id,length`, and verify incoming frames use
-`+IPD,id,length:<payload>`. Leaving ZXNext must close both sockets and return
-the daemon to its idle state. The observed NXTEL transparent-mode command
-sequence is covered by host tests. With the patched core installed, NXTEL's
-ESP reset should log `ESP hardware reset detected`, close its transparent
-socket, and restart the emulator in AT command mode. That complete reset
-sequence remains to be verified on MiSTer.
+`+IPD,id,length:<payload>`. An inbound acceptance run should create a server,
+connect to the MiSTer port from another machine, retrieve passive data with
+`CIPRECVDATA`, and send a reply through that connection ID. Leaving ZXNext must
+close the listener and every socket, returning the daemon to its idle state.
+The observed NXTEL transparent-mode command sequence is covered by host tests.
+With the patched core installed, NXTEL's ESP reset should log `ESP hardware
+reset detected`, close its transparent socket, and restart the emulator in AT
+command mode. That complete reset sequence remains to be verified on MiSTer.

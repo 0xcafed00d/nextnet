@@ -223,6 +223,29 @@ func TestTransmissionCompatibilityModes(t *testing.T) {
 	}
 }
 
+func TestCIPServerTimeoutCommands(t *testing.T) {
+	emulator := New(slog.New(slog.NewTextHandler(io.Discard, nil)), Config{})
+
+	result := emulator.executeCommand(context.Background(), "AT+CIPSTO?")
+	if !result.known || result.rejected != "" || string(result.response) != "\r\n+CIPSTO:0\r\n\r\nOK\r\n" {
+		t.Fatalf("initial CIPSTO query = %+v", result)
+	}
+	result = emulator.executeCommand(context.Background(), "AT+CIPSTO=30")
+	if !result.known || result.rejected != "" || string(result.response) != string(responseOK) || emulator.serverTimeout != 30 {
+		t.Fatalf("CIPSTO setter = %+v timeout %d", result, emulator.serverTimeout)
+	}
+	result = emulator.executeCommand(context.Background(), "AT+CIPSTO?")
+	if !result.known || result.rejected != "" || string(result.response) != "\r\n+CIPSTO:30\r\n\r\nOK\r\n" {
+		t.Fatalf("updated CIPSTO query = %+v", result)
+	}
+	for _, command := range []string{"AT+CIPSTO=-1", "AT+CIPSTO=7201", "AT+CIPSTO=thirty"} {
+		result = emulator.executeCommand(context.Background(), command)
+		if !result.known || result.rejected == "" || string(result.response) != string(responseError) {
+			t.Errorf("invalid timeout %q was not rejected: %+v", command, result)
+		}
+	}
+}
+
 func TestParseCIPStart(t *testing.T) {
 	arguments, err := parseCIPStart(`AT+CIPSTART="TCP","example.com",8080`)
 	if err != nil {
@@ -290,6 +313,66 @@ func TestParseCIPSend(t *testing.T) {
 	} {
 		if _, err := parseCIPSend(command); err == nil {
 			t.Errorf("parseCIPSend(%q) succeeded", command)
+		}
+	}
+}
+
+func TestParseCIPServer(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		want    cipServerArguments
+	}{
+		{command: "AT+CIPSERVER=0", want: cipServerArguments{mode: 0, port: 333}},
+		{command: "AT+CIPSERVER=0,1", want: cipServerArguments{mode: 0, port: 333, closeConnections: true}},
+		{command: "AT+CIPSERVER=1", want: cipServerArguments{mode: 1, port: 333}},
+		{command: "AT+CIPSERVER=1,80", want: cipServerArguments{mode: 1, port: 80}},
+		{command: `AT+CIPSERVER=1,8080,"TCP"`, want: cipServerArguments{mode: 1, port: 8080}},
+	} {
+		got, err := parseCIPServer(tc.command)
+		if err != nil {
+			t.Fatalf("parseCIPServer(%q): %v", tc.command, err)
+		}
+		if got != tc.want {
+			t.Fatalf("parseCIPServer(%q) = %+v, want %+v", tc.command, got, tc.want)
+		}
+	}
+	for _, command := range []string{
+		"AT+CIPSERVER=2",
+		"AT+CIPSERVER=0,2",
+		"AT+CIPSERVER=1,0",
+		`AT+CIPSERVER=1,80,"SSL"`,
+		"AT+CIPSERVER=1,80,TCP,extra",
+	} {
+		if _, err := parseCIPServer(command); err == nil {
+			t.Errorf("parseCIPServer(%q) succeeded", command)
+		}
+	}
+}
+
+func TestParseCIPRecvData(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		want    cipRecvDataArguments
+	}{
+		{command: "AT+CIPRECVDATA=512", want: cipRecvDataArguments{id: 0, length: 512}},
+		{command: "AT+CIPRECVDATA=3,4096", want: cipRecvDataArguments{id: 3, hasID: true, length: 4096}},
+	} {
+		got, err := parseCIPRecvData(tc.command)
+		if err != nil {
+			t.Fatalf("parseCIPRecvData(%q): %v", tc.command, err)
+		}
+		if got != tc.want {
+			t.Fatalf("parseCIPRecvData(%q) = %+v, want %+v", tc.command, got, tc.want)
+		}
+	}
+	for _, command := range []string{
+		"AT+CIPRECVDATA=0",
+		"AT+CIPRECVDATA=5,10",
+		"AT+CIPRECVDATA=0,1,2",
+		"AT+CIPRECVDATA=0,2147483648",
+	} {
+		if _, err := parseCIPRecvData(command); err == nil {
+			t.Errorf("parseCIPRecvData(%q) succeeded", command)
 		}
 	}
 }

@@ -54,15 +54,24 @@ the `nextnet-mister` folder from the SD card.
 - NXtel 
 - getit 
 - zxdb-dl
-- telnet-v1.51
+- Terminex II v1.51
+- NextBench - fileserve/update/getit.
 
 Raise an issue if you encounter any Next network programs that do not work with nextnet.
 
 ## Note 
 In order for nextnet to reset correctly, it needs a change to the ZX Spectrum Next core. This change is pending and will be included in a future core update.
-Until then if the nextnet gets into an incorrect state, you may need to force a reset by closing the Next core and restarting it.
+In the meantime, the update to the Spectrum Next core is included in the nextnet release package itself.
+Simply copy the RBF file into the '_Unstable' folder on the on the root of the SD card, and start this core from the MiSTer menu, until the updated core is released..
+If not using this updated core, nextnet may not reset correctly. Until then if the nextnet gets into an incorrect state, you may need to force a reset by closing the Next core and restarting it.
 
-## version history 
+## Version History 
 
+### v0.2.0
+- Added support for incoming network connections
+- Tested with various NextBench applications
+- Implemented activity timeout for network connections
+- Included updated Spectrum Next core - for resetting nextnet correctly
 ### v0.1.0
 - Initial public release
+

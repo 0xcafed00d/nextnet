@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -203,6 +204,145 @@ func TestManagerLocalCloseSuppressesEvent(t *testing.T) {
 	manager.Wait()
 }
 
+func TestManagerAcceptsInboundTCPConnections(t *testing.T) {
+	listener := newPipeListener(&net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 8080})
+	connected := make(chan Link, 1)
+	data := make(chan dataEvent, 1)
+	closed := make(chan int, 1)
+	manager := New(
+		dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("unexpected outgoing connection")
+		}),
+		Events{
+			Connected: func(link Link) { connected <- link },
+			Data:      func(link Link, payload []byte) { data <- dataEvent{id: link.ID, payload: payload} },
+			Closed:    func(link Link) { closed <- link.ID },
+		},
+		time.Second,
+		listenerFunc(func(_ context.Context, network, address string) (net.Listener, error) {
+			if network != "tcp" || address != ":8080" {
+				t.Fatalf("listen = %q %q, want tcp :8080", network, address)
+			}
+			return listener, nil
+		}),
+	)
+
+	if err := manager.StartTCPServer(context.Background(), 8080); err != nil {
+		t.Fatal(err)
+	}
+	if port, running := manager.ServerPort(); !running || port != 8080 {
+		t.Fatalf("server = port %d running %v, want port 8080", port, running)
+	}
+	client, server := net.Pipe()
+	listener.offer(&addressedConn{
+		Conn:   server,
+		local:  listener.Addr(),
+		remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 4567},
+	})
+	defer client.Close()
+
+	var link Link
+	select {
+	case link = <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for inbound connection event")
+	}
+	if link.ID != 0 || !link.Inbound || !link.Multiplexed {
+		t.Fatalf("inbound link = %+v", link)
+	}
+	statuses := manager.Statuses()
+	if len(statuses) != 1 || statuses[0].ID != 0 || !statuses[0].Inbound || statuses[0].LocalPort != 8080 {
+		t.Fatalf("inbound statuses = %+v", statuses)
+	}
+
+	if _, err := client.Write([]byte("REQUEST")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-data:
+		if event.id != 0 || string(event.payload) != "REQUEST" {
+			t.Fatalf("inbound data = id %d payload %q", event.id, event.payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for inbound data")
+	}
+
+	response := make(chan string, 1)
+	go func() {
+		buffer := make([]byte, 8)
+		_, _ = io.ReadFull(client, buffer)
+		response <- string(buffer)
+	}()
+	if err := manager.Send(0, []byte("RESPONSE")); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-response; got != "RESPONSE" {
+		t.Fatalf("inbound client received %q", got)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-closed:
+		if id != 0 {
+			t.Fatalf("closed ID = %d, want 0", id)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for inbound close")
+	}
+	if !manager.StopTCPServer(false) {
+		t.Fatal("server was not stopped")
+	}
+	manager.Wait()
+}
+
+func TestManagerAppliesTimeoutToExistingInboundConnection(t *testing.T) {
+	listener := newPipeListener(&net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 8080})
+	connected := make(chan Link, 1)
+	timedOut := make(chan Link, 1)
+	manager := New(nil, Events{
+		Connected: func(link Link) { connected <- link },
+		TimedOut:  func(link Link) { timedOut <- link },
+	}, time.Second, listenerFunc(func(context.Context, string, string) (net.Listener, error) {
+		return listener, nil
+	}))
+	if err := manager.StartTCPServer(context.Background(), 8080); err != nil {
+		t.Fatal(err)
+	}
+	client, server := net.Pipe()
+	listener.offer(&addressedConn{
+		Conn:   server,
+		local:  listener.Addr(),
+		remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 4567},
+	})
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for inbound connection")
+	}
+
+	manager.SetServerTimeout(25 * time.Millisecond)
+	if got := manager.ServerTimeout(); got != 25*time.Millisecond {
+		t.Fatalf("server timeout = %v, want 25ms", got)
+	}
+	select {
+	case link := <-timedOut:
+		if link.ID != 0 {
+			t.Fatalf("timed out ID = %d, want 0", link.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("inbound connection did not time out")
+	}
+	buffer := make([]byte, 1)
+	if _, err := client.Read(buffer); !errors.Is(err, io.EOF) {
+		t.Fatalf("client read after timeout = %v, want EOF", err)
+	}
+	_ = client.Close()
+	manager.Shutdown()
+	manager.Wait()
+}
+
 func TestConfigureTCPKeepAlive(t *testing.T) {
 	connection := &keepAliveConn{}
 	if err := configureTCPKeepAlive(connection, Link{HasKeepAlive: true, KeepAlive: 7}); err != nil {
@@ -240,3 +380,58 @@ type dialerFunc func(context.Context, string, string) (net.Conn, error)
 func (function dialerFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	return function(ctx, network, address)
 }
+
+type listenerFunc func(context.Context, string, string) (net.Listener, error)
+
+func (function listenerFunc) Listen(ctx context.Context, network, address string) (net.Listener, error) {
+	return function(ctx, network, address)
+}
+
+type pipeListener struct {
+	connections chan net.Conn
+	closed      chan struct{}
+	closeOnce   sync.Once
+	address     net.Addr
+}
+
+func newPipeListener(address net.Addr) *pipeListener {
+	return &pipeListener{
+		connections: make(chan net.Conn, 5),
+		closed:      make(chan struct{}),
+		address:     address,
+	}
+}
+
+func (listener *pipeListener) offer(connection net.Conn) {
+	listener.connections <- connection
+}
+
+func (listener *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case <-listener.closed:
+		return nil, net.ErrClosed
+	default:
+	}
+	select {
+	case connection := <-listener.connections:
+		return connection, nil
+	case <-listener.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (listener *pipeListener) Close() error {
+	listener.closeOnce.Do(func() { close(listener.closed) })
+	return nil
+}
+
+func (listener *pipeListener) Addr() net.Addr { return listener.address }
+
+type addressedConn struct {
+	net.Conn
+	local  net.Addr
+	remote net.Addr
+}
+
+func (connection *addressedConn) LocalAddr() net.Addr  { return connection.local }
+func (connection *addressedConn) RemoteAddr() net.Addr { return connection.remote }
