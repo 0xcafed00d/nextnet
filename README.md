@@ -9,23 +9,28 @@ Wi-Fi module can use the MiSTer's built-in network connection.
 1. Download the nextnet release ZIP file and extract it on your computer.
 2. Turn off MiSTer and put its SD card into your computer.
 3. Open the root folder on the SD card.
-4. Copy the complete extracted `nextnet-mister` folder to the root of the SD card. Keep all
-   the files together. The SD card should then contain:
+4. Copy the extracted `nextnet` and `Scripts` folders to the root of the SD
+   card. Merge the `Scripts` folder with the one already on the card if asked.
+   The SD card should then contain:
 
-   ```text  
-    nextnet-mister/
+   ```text
+    nextnet/
         nextnet
         install.sh
         uninstall.sh
+        LICENSE
+        README.md
+    Scripts/
+        nextnet_installer.sh
    ```
 
 5. Safely eject the SD card, put it back into MiSTer, and start MiSTer.
-6. From the main MiSTer menu, open **Scripts**, then navigate to **nextnet-mister**, and run
-   **install**.
+6. From the main MiSTer menu, open **Scripts** and run
+   **nextnet_installer**. Select **Install or update NEXTNET**.
 
 The installer starts nextnet immediately and configures it to start
-automatically whenever MiSTer boots. Leave the `nextnet-mister` folder in the
-same place after installation.
+automatically whenever MiSTer boots. Leave the `nextnet` folder in place after
+installation.
 
 MiSTer must already have a working network connection. nextnet uses that
 connection, the type of connection MiSTer is using (Ethernet or Wi-Fi) does not matter.
@@ -40,14 +45,17 @@ time the Next core starts.
 
 ## Update
 
-Replace the files in `nextnet-mister` with those from the new release,
-run **install** again from the MiSTer Scripts menu, and then restart MiSTer.
+Copy the replacement `nextnet` and `Scripts` folders to the SD card, run
+**nextnet_installer** from the MiSTer Scripts menu, and select
+**Install or update NEXTNET**. Restart MiSTer to ensure a running older version
+is replaced.
 
 ## Uninstall
 
-From the MiSTer Scripts menu, open **nextnet-mister** and run **uninstall**.
-This stops nextnet and removes its automatic startup entry. You can then delete
-the `nextnet-mister` folder from the SD card.
+Run **nextnet_installer** from the MiSTer Scripts menu and select
+**Uninstall NEXTNET**. This stops nextnet and removes its automatic startup
+entry. You can then delete the `nextnet` folder and
+`Scripts/nextnet_installer.sh` from the SD card.
 
 ## This has been tested with the following ZX Spectrum Next network programs:
 - http dot command

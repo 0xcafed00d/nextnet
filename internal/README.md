@@ -141,30 +141,31 @@ tag is removed so the release can be corrected and retried.
 
 ## Install on MiSTer
 
-Copy either package to a permanent location on the MiSTer SD card, extract it,
-and run the installer as root. For the ZIP release:
+Copy either package to the root of the MiSTer SD card. It installs the binary
+and support files under `/media/fat/nextnet` and the menu installer under
+`/media/fat/Scripts`. For the ZIP release:
 
 ```sh
 sha256sum -c nextnet-mister-armv7-v0.1.0.zip.sha256
-unzip nextnet-mister-armv7-v0.1.0.zip
-cd nextnet-mister
-./install.sh
+cd /media/fat
+unzip /path/to/nextnet-mister-armv7-v0.1.0.zip
+./Scripts/nextnet_installer.sh --install
 ```
 
 For the tar archive:
 
 ```sh
 sha256sum -c nextnet-mister-armv7.tar.gz.sha256
-tar -xzf nextnet-mister-armv7.tar.gz
-cd nextnet-mister
-./install.sh
+cd /media/fat
+tar -xzf /path/to/nextnet-mister-armv7.tar.gz
+./Scripts/nextnet_installer.sh --install
 ```
 
-The installer can safely be run again after replacing or updating the bundle.
-It:
+With no argument, `nextnet_installer.sh` prompts to install/update, uninstall,
+or exit. `--install` and `--uninstall` select an action without a prompt. The
+installer can safely be run again after replacing or updating the package. It:
 
-- makes the existing `nextnet` binary executable and runs it from the directory
-  where the package was extracted; it does not copy the program elsewhere
+- makes `/media/fat/nextnet/nextnet` executable and runs it in place
 - preserves unrelated contents of `/media/fat/linux/user-startup.sh`
 - adds exactly one marked automatic-startup block using the binary's absolute
   path
@@ -172,29 +173,28 @@ It:
   time it edits an existing file
 - starts the daemon immediately unless it is already running
 
-For example, if the archive was extracted directly under `/media/fat`, then at
-subsequent MiSTer boots `user-startup.sh` launches:
+At subsequent MiSTer boots `user-startup.sh` launches:
 
 ```sh
-/media/fat/nextnet-mister/nextnet -device /dev/ttyS1 -baud 115200
+/media/fat/nextnet/nextnet -device /dev/ttyS1 -baud 115200
 ```
 
-Do not move or delete the extracted directory after installation. If it is
-moved, run `install.sh` again from the new location to update the startup path.
+Do not move or delete `/media/fat/nextnet` while NEXTNET is installed.
 
 Output is redirected to the volatile `/tmp/nextnet.log`, avoiding continuous
 writes to the SD card. The daemon holds `/tmp/nextnet.lock`, so manual or
 duplicate startup attempts cannot own the UART simultaneously.
 
-To stop nextnet and remove only its marked startup block, run the uninstaller
-from that same extracted directory:
+To stop nextnet and remove only its marked startup block, run:
 
 ```sh
-./uninstall.sh
+./Scripts/nextnet_installer.sh --uninstall
 ```
 
 The uninstaller leaves the package files in place so they can be installed
-again or deleted manually.
+again or deleted manually. The original `nextnet/install.sh` and
+`nextnet/uninstall.sh` scripts remain in the package for compatibility with
+older installation instructions.
 
 ## Run manually on MiSTer
 
@@ -202,7 +202,7 @@ For development, copy the ARMv7 executable to MiSTer, make it executable, and
 run it as root from wherever it was copied:
 
 ```sh
-/media/fat/nextnet -device /dev/ttyS1 -baud 115200
+/media/fat/nextnet/nextnet -device /dev/ttyS1 -baud 115200
 ```
 
 The `-device` option can be omitted to auto-select `/dev/ttyS1` when it exists.

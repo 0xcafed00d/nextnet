@@ -46,48 +46,60 @@ fi
 
 mkdir -p "$DIST_DIR"
 STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/nextnet-release.XXXXXX")
-BUNDLE_DIR="$STAGE_DIR/nextnet-mister"
+NEXTNET_DIR="$STAGE_DIR/nextnet"
+MISTER_SCRIPTS_DIR="$STAGE_DIR/Scripts"
 ARCHIVE_NAME="nextnet-mister-armv7-$ARCHIVE_VERSION.zip"
 CHECKSUM_NAME="$ARCHIVE_NAME.sha256"
 
 cleanup() {
-	rm -f "$BUNDLE_DIR/nextnet" "$BUNDLE_DIR/install.sh" \
-		"$BUNDLE_DIR/uninstall.sh" "$BUNDLE_DIR/README.md" \
-		"$BUNDLE_DIR/examples/esp-reset.bas" \
+	rm -f "$NEXTNET_DIR/nextnet" "$NEXTNET_DIR/install.sh" \
+		"$NEXTNET_DIR/uninstall.sh" "$NEXTNET_DIR/README.md" \
+		"$NEXTNET_DIR/LICENSE" "$NEXTNET_DIR/examples/esp-reset.bas" \
+		"$MISTER_SCRIPTS_DIR/nextnet_installer.sh" \
 		"$STAGE_DIR/$ARCHIVE_NAME"
-	rmdir "$BUNDLE_DIR/examples" 2>/dev/null || true
-	rmdir "$BUNDLE_DIR" 2>/dev/null || true
+	rmdir "$NEXTNET_DIR/examples" 2>/dev/null || true
+	rmdir "$NEXTNET_DIR" 2>/dev/null || true
+	rmdir "$MISTER_SCRIPTS_DIR" 2>/dev/null || true
 	rmdir "$STAGE_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$BUNDLE_DIR/examples"
+mkdir -p "$NEXTNET_DIR/examples" "$MISTER_SCRIPTS_DIR"
 
 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
 	go build -C "$PROJECT_DIR" -buildvcs=false -trimpath \
 	-ldflags="-s -w -X nextnet/internal/version.Version=$RELEASE_VERSION" \
-	-o "$BUNDLE_DIR/nextnet" ./cmd/nextnet
+	-o "$NEXTNET_DIR/nextnet" ./cmd/nextnet
 
-cp "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/uninstall.sh" "$BUNDLE_DIR/"
-cp "$PROJECT_DIR/README.md" "$BUNDLE_DIR/README.md"
-cp "$PROJECT_DIR/examples/esp-reset.bas" "$BUNDLE_DIR/examples/"
-chmod 755 "$BUNDLE_DIR/nextnet" "$BUNDLE_DIR/install.sh" "$BUNDLE_DIR/uninstall.sh"
-chmod 644 "$BUNDLE_DIR/README.md" "$BUNDLE_DIR/examples/esp-reset.bas"
+cp "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/uninstall.sh" "$NEXTNET_DIR/"
+cp "$SCRIPT_DIR/nextnet_installer.sh" "$MISTER_SCRIPTS_DIR/"
+cp "$PROJECT_DIR/README.md" "$NEXTNET_DIR/README.md"
+cp "$PROJECT_DIR/LICENSE" "$NEXTNET_DIR/LICENSE"
+cp "$PROJECT_DIR/examples/esp-reset.bas" "$NEXTNET_DIR/examples/"
+chmod 755 "$NEXTNET_DIR/nextnet" "$NEXTNET_DIR/install.sh" \
+	"$NEXTNET_DIR/uninstall.sh" "$MISTER_SCRIPTS_DIR/nextnet_installer.sh"
+chmod 644 "$NEXTNET_DIR/README.md" "$NEXTNET_DIR/LICENSE" \
+	"$NEXTNET_DIR/examples/esp-reset.bas"
 
-touch -d "@$SOURCE_DATE_EPOCH" "$BUNDLE_DIR" "$BUNDLE_DIR/nextnet" \
-	"$BUNDLE_DIR/install.sh" "$BUNDLE_DIR/uninstall.sh" "$BUNDLE_DIR/README.md" \
-	"$BUNDLE_DIR/examples" "$BUNDLE_DIR/examples/esp-reset.bas"
+touch -d "@$SOURCE_DATE_EPOCH" "$NEXTNET_DIR" "$NEXTNET_DIR/nextnet" \
+	"$NEXTNET_DIR/install.sh" "$NEXTNET_DIR/uninstall.sh" \
+	"$NEXTNET_DIR/README.md" "$NEXTNET_DIR/LICENSE" \
+	"$NEXTNET_DIR/examples" "$NEXTNET_DIR/examples/esp-reset.bas" \
+	"$MISTER_SCRIPTS_DIR" "$MISTER_SCRIPTS_DIR/nextnet_installer.sh"
 
 (
 	cd "$STAGE_DIR"
 	TZ=UTC zip -X -q "$ARCHIVE_NAME" \
-		nextnet-mister/ \
-		nextnet-mister/nextnet \
-		nextnet-mister/install.sh \
-		nextnet-mister/uninstall.sh \
-		nextnet-mister/README.md \
-		nextnet-mister/examples/ \
-		nextnet-mister/examples/esp-reset.bas
+		nextnet/ \
+		nextnet/nextnet \
+		nextnet/install.sh \
+		nextnet/uninstall.sh \
+		nextnet/README.md \
+		nextnet/LICENSE \
+		nextnet/examples/ \
+		nextnet/examples/esp-reset.bas \
+		Scripts/ \
+		Scripts/nextnet_installer.sh
 )
 
 mv -f "$STAGE_DIR/$ARCHIVE_NAME" "$DIST_DIR/$ARCHIVE_NAME"
