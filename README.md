@@ -21,14 +21,14 @@ Wi-Fi module can use the MiSTer's built-in network connection.
         LICENSE
         README.md
     Scripts/
-        nextnet_installer.sh
+        nextnet_enable.sh
    ```
 
 5. Safely eject the SD card, put it back into MiSTer, and start MiSTer.
 6. From the main MiSTer menu, open **Scripts** and run
-   **nextnet_installer**. Select **Install or update NEXTNET**.
+   **nextnet_enable**. Select **Enable NEXTNET**.
 
-The installer starts nextnet immediately and configures it to start
+The enable script starts nextnet immediately and configures it to start
 automatically whenever MiSTer boots. Leave the `nextnet` folder in place after
 installation.
 
@@ -46,16 +46,16 @@ time the Next core starts.
 ## Update
 
 Copy the replacement `nextnet` and `Scripts` folders to the SD card, run
-**nextnet_installer** from the MiSTer Scripts menu, and select
-**Install or update NEXTNET**. Restart MiSTer to ensure a running older version
+**nextnet_enable** from the MiSTer Scripts menu, and select
+**Enable NEXTNET**. Restart MiSTer to ensure a running older version
 is replaced.
 
-## Uninstall
+## Disable and remove
 
-Run **nextnet_installer** from the MiSTer Scripts menu and select
-**Uninstall NEXTNET**. This stops nextnet and removes its automatic startup
+Run **nextnet_enable** from the MiSTer Scripts menu and select
+**Disable NEXTNET**. This stops nextnet and removes its automatic startup
 entry. You can then delete the `nextnet` folder and
-`Scripts/nextnet_installer.sh` from the SD card.
+`Scripts/nextnet_enable.sh` from the SD card.
 
 ## This has been tested with the following ZX Spectrum Next network programs:
 - http dot command

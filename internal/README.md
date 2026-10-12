@@ -142,14 +142,14 @@ tag is removed so the release can be corrected and retried.
 ## Install on MiSTer
 
 Copy either package to the root of the MiSTer SD card. It installs the binary
-and support files under `/media/fat/nextnet` and the menu installer under
+and support files under `/media/fat/nextnet` and the enable script under
 `/media/fat/Scripts`. For the ZIP release:
 
 ```sh
 sha256sum -c nextnet-mister-armv7-v0.1.0.zip.sha256
 cd /media/fat
 unzip /path/to/nextnet-mister-armv7-v0.1.0.zip
-./Scripts/nextnet_installer.sh --install
+./Scripts/nextnet_enable.sh --enable
 ```
 
 For the tar archive:
@@ -158,12 +158,12 @@ For the tar archive:
 sha256sum -c nextnet-mister-armv7.tar.gz.sha256
 cd /media/fat
 tar -xzf /path/to/nextnet-mister-armv7.tar.gz
-./Scripts/nextnet_installer.sh --install
+./Scripts/nextnet_enable.sh --enable
 ```
 
-With no argument, `nextnet_installer.sh` prompts to install/update, uninstall,
-or exit. `--install` and `--uninstall` select an action without a prompt. The
-installer can safely be run again after replacing or updating the package. It:
+With no argument, `nextnet_enable.sh` prompts to enable, disable, or exit.
+`--enable` and `--disable` select an action without a prompt. The script can
+safely be run again after replacing or updating the package. It:
 
 - makes `/media/fat/nextnet/nextnet` executable and runs it in place
 - preserves unrelated contents of `/media/fat/linux/user-startup.sh`
@@ -188,11 +188,11 @@ duplicate startup attempts cannot own the UART simultaneously.
 To stop nextnet and remove only its marked startup block, run:
 
 ```sh
-./Scripts/nextnet_installer.sh --uninstall
+./Scripts/nextnet_enable.sh --disable
 ```
 
-The uninstaller leaves the package files in place so they can be installed
-again or deleted manually. The original `nextnet/install.sh` and
+Disabling leaves the package files in place so they can be enabled again or
+deleted manually. The original `nextnet/install.sh` and
 `nextnet/uninstall.sh` scripts remain in the package for compatibility with
 older installation instructions.
 

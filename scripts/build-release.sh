@@ -55,7 +55,7 @@ cleanup() {
 	rm -f "$NEXTNET_DIR/nextnet" "$NEXTNET_DIR/install.sh" \
 		"$NEXTNET_DIR/uninstall.sh" "$NEXTNET_DIR/README.md" \
 		"$NEXTNET_DIR/LICENSE" "$NEXTNET_DIR/examples/esp-reset.bas" \
-		"$MISTER_SCRIPTS_DIR/nextnet_installer.sh" \
+		"$MISTER_SCRIPTS_DIR/nextnet_enable.sh" \
 		"$STAGE_DIR/$ARCHIVE_NAME"
 	rmdir "$NEXTNET_DIR/examples" 2>/dev/null || true
 	rmdir "$NEXTNET_DIR" 2>/dev/null || true
@@ -72,12 +72,12 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
 	-o "$NEXTNET_DIR/nextnet" ./cmd/nextnet
 
 cp "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/uninstall.sh" "$NEXTNET_DIR/"
-cp "$SCRIPT_DIR/nextnet_installer.sh" "$MISTER_SCRIPTS_DIR/"
+cp "$SCRIPT_DIR/nextnet_enable.sh" "$MISTER_SCRIPTS_DIR/"
 cp "$PROJECT_DIR/README.md" "$NEXTNET_DIR/README.md"
 cp "$PROJECT_DIR/LICENSE" "$NEXTNET_DIR/LICENSE"
 cp "$PROJECT_DIR/examples/esp-reset.bas" "$NEXTNET_DIR/examples/"
 chmod 755 "$NEXTNET_DIR/nextnet" "$NEXTNET_DIR/install.sh" \
-	"$NEXTNET_DIR/uninstall.sh" "$MISTER_SCRIPTS_DIR/nextnet_installer.sh"
+	"$NEXTNET_DIR/uninstall.sh" "$MISTER_SCRIPTS_DIR/nextnet_enable.sh"
 chmod 644 "$NEXTNET_DIR/README.md" "$NEXTNET_DIR/LICENSE" \
 	"$NEXTNET_DIR/examples/esp-reset.bas"
 
@@ -85,7 +85,7 @@ touch -d "@$SOURCE_DATE_EPOCH" "$NEXTNET_DIR" "$NEXTNET_DIR/nextnet" \
 	"$NEXTNET_DIR/install.sh" "$NEXTNET_DIR/uninstall.sh" \
 	"$NEXTNET_DIR/README.md" "$NEXTNET_DIR/LICENSE" \
 	"$NEXTNET_DIR/examples" "$NEXTNET_DIR/examples/esp-reset.bas" \
-	"$MISTER_SCRIPTS_DIR" "$MISTER_SCRIPTS_DIR/nextnet_installer.sh"
+	"$MISTER_SCRIPTS_DIR" "$MISTER_SCRIPTS_DIR/nextnet_enable.sh"
 
 (
 	cd "$STAGE_DIR"
@@ -99,7 +99,7 @@ touch -d "@$SOURCE_DATE_EPOCH" "$NEXTNET_DIR" "$NEXTNET_DIR/nextnet" \
 		nextnet/examples/ \
 		nextnet/examples/esp-reset.bas \
 		Scripts/ \
-		Scripts/nextnet_installer.sh
+		Scripts/nextnet_enable.sh
 )
 
 mv -f "$STAGE_DIR/$ARCHIVE_NAME" "$DIST_DIR/$ARCHIVE_NAME"

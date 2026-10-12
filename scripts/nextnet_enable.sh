@@ -2,7 +2,7 @@
 
 set -eu
 
-PROGRAM=nextnet-installer
+PROGRAM=nextnet-enable
 BEGIN_MARKER="# BEGIN nextnet"
 END_MARKER="# END nextnet"
 MEDIA_ROOT=${NEXTNET_MEDIA_ROOT:-/media/fat}
@@ -20,7 +20,7 @@ fail() {
 }
 
 usage() {
-	printf 'Usage: %s [--install | --uninstall | --help]\n' "$0"
+	printf 'Usage: %s [--enable | --disable | --help]\n' "$0"
 }
 
 cleanup() {
@@ -133,7 +133,7 @@ find_running_pid() {
 	esac
 }
 
-install_nextnet() {
+enable_nextnet() {
 	[ -f "$BINARY" ] || fail "nextnet binary not found: $BINARY"
 	mkdir -p "$LINUX_DIR"
 	check_startup_file
@@ -172,7 +172,7 @@ install_nextnet() {
 	printf 'Log: /tmp/nextnet.log\n'
 }
 
-uninstall_nextnet() {
+disable_nextnet() {
 	check_startup_file
 
 	if [ "$STARTUP_BEGIN_COUNT" -gt 0 ]; then
@@ -203,15 +203,15 @@ uninstall_nextnet() {
 }
 
 prompt_action() {
-	printf '\nNEXTNET installer\n\n'
-	printf '  1) Install NEXTNET\n'
-	printf '  2) Uninstall NEXTNET\n'
+	printf '\nNEXTNET enable/disable\n\n'
+	printf '  1) Enable NEXTNET\n'
+	printf '  2) Disable NEXTNET\n'
 	printf '  3) Exit without making changes\n\n'
 	printf 'Select an option [1-3]: '
 	IFS= read -r selection || fail "no selection received"
 	case $selection in
-		1|i|I|install|INSTALL) ACTION=install ;;
-		2|u|U|uninstall|UNINSTALL) ACTION=uninstall ;;
+		1|e|E|enable|ENABLE) ACTION=enable ;;
+		2|d|D|disable|DISABLE) ACTION=disable ;;
 		3|q|Q|quit|QUIT|'') ACTION=exit ;;
 		*) fail "invalid selection: $selection" ;;
 	esac
@@ -221,8 +221,8 @@ case $# in
 	0) ACTION=prompt ;;
 	1)
 		case $1 in
-			--install) ACTION=install ;;
-			--uninstall) ACTION=uninstall ;;
+			--enable) ACTION=enable ;;
+			--disable) ACTION=disable ;;
 			-h|--help)
 				usage
 				exit 0
@@ -240,7 +240,7 @@ case $# in
 esac
 
 if [ "$MEDIA_ROOT" = "/media/fat" ] && [ "$(id -u)" -ne 0 ]; then
-	fail "run this installer as root on MiSTer"
+	fail "run this script as root on MiSTer"
 fi
 
 if [ "$ACTION" = prompt ]; then
@@ -248,7 +248,7 @@ if [ "$ACTION" = prompt ]; then
 fi
 
 case $ACTION in
-	install) install_nextnet ;;
-	uninstall) uninstall_nextnet ;;
+	enable) enable_nextnet ;;
+	disable) disable_nextnet ;;
 	exit) printf 'No changes made\n' ;;
 esac

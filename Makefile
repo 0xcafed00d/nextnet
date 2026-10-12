@@ -6,7 +6,7 @@ LDFLAGS := -X nextnet/internal/version.Version=$(BUILD_VERSION)
 test:
 	go test ./...
 	sh scripts/install_test.sh
-	sh scripts/nextnet_installer_test.sh
+	sh scripts/nextnet_enable_test.sh
 	sh scripts/version_test.sh
 	sh scripts/release_test.sh
 
@@ -28,13 +28,13 @@ package-mister: build-mister
 	mkdir -p dist/nextnet-mister-package/nextnet/examples dist/nextnet-mister-package/Scripts
 	cp dist/nextnet-linux-armv7 dist/nextnet-mister-package/nextnet/nextnet
 	cp scripts/install.sh scripts/uninstall.sh dist/nextnet-mister-package/nextnet/
-	cp scripts/nextnet_installer.sh dist/nextnet-mister-package/Scripts/
+	cp scripts/nextnet_enable.sh dist/nextnet-mister-package/Scripts/
 	cp README.md LICENSE dist/nextnet-mister-package/nextnet/
 	cp examples/esp-reset.bas dist/nextnet-mister-package/nextnet/examples/
 	chmod 755 dist/nextnet-mister-package/nextnet/nextnet \
 		dist/nextnet-mister-package/nextnet/install.sh \
 		dist/nextnet-mister-package/nextnet/uninstall.sh \
-		dist/nextnet-mister-package/Scripts/nextnet_installer.sh
+		dist/nextnet-mister-package/Scripts/nextnet_enable.sh
 	chmod 644 dist/nextnet-mister-package/nextnet/README.md \
 		dist/nextnet-mister-package/nextnet/LICENSE \
 		dist/nextnet-mister-package/nextnet/examples/esp-reset.bas
